@@ -1,32 +1,61 @@
-#!/bin/ash
+#!/bin/sh
 # vim: foldmarker=[[[,]]]:
 
 # =============================================================================
 # Findnrun - a progressive finder
-  Version=2.4.0
-# authors: Copyright (C)2015-2016 step; (C)2015 SFR, L18L
-# license: GNU GPL applies
-# depends: gtk-dialog 0.8.3+, gawk, ash (or bash), mdview (NLS help only)
+  Version=4.0.3
+# authors: Copyright (C)2015-2020 step; (C)2015 SFR, L18L
+# license: GNU GPL version 2
+# depend: gtk-dialog 0.8.3+, gawk 4.1.0+, sh/ash/dash/bash, xwininfo, yad
+# suggest: fzf, mdview (markdown help), proc(5) (restart findnrun), GNU date (debug)
 # source: https://github.com/step-/find-n-run
 # forum: http://www.murga-linux.com/puppy/viewtopic.php?t=102811
 # =============================================================================
 
+if [ "$FNRDEBUG" ]; then # [[[1 timer
+  timer() {
+    # $3 and $4 are optional, start $4 with "+" to insert default label
+    awk -v "t1=$1" -v "t2=$2" -v "t0=$3" -v "label=$4" '
+BEGIN {
+  label0 = "ELAPSED ms"
+  if("" == label) {
+    label = label0
+  } else if(1 == index(label, "+")) {
+  label = label0 " " substr(label, 2)
+  }
+  partial = (t2 - t1) * 1000
+  if("" != t0) {
+    total = (t2 - t0) * 1000
+    fmt = "%s %g (total %g)"
+  } else {
+    fmt = "%s %g%s"
+  }
+  printf "\033[7m" fmt "\033[0m\n", label, partial, total
+  exit
+}'
+  }
+  TIMER0=$(date +%s.%N) # needs GNU date
+fi
+SN=findnrun
 # Localization settings. [[[1
 export TEXTDOMAIN=findnrun
 export OUTPUT_CHARSET=UTF-8
+. "${0%/*}"/../share/$SN/i18n_table.sh && i18n_table
 >/dev/null gettext 'INSTRUCTIONS FOR TRANSLATORS
 1 Download the latest commented translation template from:
   https://raw.githubusercontent.com/step-/find-n-run/master/usr/share/doc/nls/findnrun/findnrun.pot
 2 Follow the translation tutorial at:
-  https://github.com/step-/find-n-run/blob/master/usr/share/doc/findnrun/TRANSLATING.md'
+  https://github.com/step-/find-n-run/blob/master/usr/share/findnrun/doc/TRANSLATING.md'
 
 # Initialize variables that can be changed. [[[1
+# Note: Some environment variables may affect operation:
+# BROWSER, GEOMETRY, LANG, FNRSEARCHENGINE and more. See /usr/share/findnrun/doc/running.md.
+
 # i18n Main window title
-APP_NAME=$(gettext "Findnrun")
-APP_TITLE="${APP_NAME}"
+APP_NAME=$i18n_Findnrun
 
 XDG_DATA_DIRS=${XDG_DATA_DIRS:-/usr/share:/usr/local/share}
-XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local}
+XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
 { read DESKTOP_FILE_DIRS; read ICON_DIRS; } << EOF
 $(
@@ -38,14 +67,18 @@ $(
 EOF
 DESKTOP_FILE_DIRS=${DESKTOP_FILE_DIRS#:} ICON_DIRS=${ICON_DIRS#:}
 # Ref. http://standards.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html#directory_layout
-# Note: Search by icon *theme* isn't implemented.
+
+# freedesktop.org standard (historical) user's icon location
+HOME_ICONS_LEGACY="$HOME/.icons" # don't change
 # Additional Fatdog64-specific locations start at .../midi-icons.
-ICON_DIRS="$HOME/.icons:${ICON_DIRS}:/usr/share/pixmaps:/usr/share/midi-icons:/usr/share/mini-icons"
+ICON_DIRS="$HOME_ICONS_LEGACY:$ICON_DIRS:/usr/share/pixmaps:/usr/share/midi-icons:/usr/share/mini-icons"
 
 [ -f "${CONFIG}" ] || CONFIG="${HOME}/.findnrunrc"
-FNRHELPINDEX=${FNRHELPINDEX:-/usr/share/doc/findnrun/index.md:/usr/share/doc/findnrun/help[en].tar.gz:/usr/share/doc/findnrun/index.html}
+x="${0%/*}/../share/$SN/doc"
+FNRHELPINDEX=${FNRHELPINDEX:-$x/index.md:$x/help[en].tar.gz:$x/index.html}
 
 # Initialize variables that should not be changed. [[[1
+APP_TITLE="${APP_NAME}" # see also APP_TITLE_UNIQ in start_main_window()
 REMARK= # leave unset
 FNRDEBUG=${FNRDEBUG:-} # unset to disable debug trace to stderr; set verbosity (integer) 1-10
 if [ -n "${FNRDEBUG}" ]; then # set DEBUG1, DEBUG2, ... [[[
@@ -63,9 +96,8 @@ trap_handler() # [[[
   trap - HUP INT QUIT TERM ABRT 0
   local tmpd ids id
   tmpd=$(readlink -f "${TMPD}")
-  [ -d "${tmpd}" ] || exit
-  if cd "${tmpd}"; then
-    # kill process / process group pids; guard system processes such as init (1).
+  if [ -d "${tmpd}" ] && cd "${tmpd}"; then
+    # kill tracked pids; defensive: guard system processes (pids 0,1)
     for id in $(grep --include .pidof_\* -hr .); do
       case ${id} in 0|1) ;; *) ids="${ids} ${id}" ;; esac
     done
@@ -80,9 +112,14 @@ trap trap_handler INT QUIT TERM HUP ABRT 0
 TMPD=`mktemp -d -p "${TMPDIR:-/tmp}" ${0##*/}_XXXXXX` && chmod 700 "${TMPD}"
 TMP0="${TMPD}/.FNRstart"; mkdir "${TMP0}" # built-in source resources
 DATF="${TMP0}/.dat" # database of .desktop file entries
+DSKL="${TMP0}/.desktop-ls" # list .desktop file paths
+AIPF="${TMPD}/.installed-icon-ls" # list system/usr installed icon file paths
 AWKB="${TMP0}/.build.awk" # builds (and queries) database
 AWKQ="${TMP0}/.query.awk" # queries database (faster)
+AWKZ="${AWKQ%.awk}"-v1-fuzzy.awk # AWKQ fuzzy search
+AWKZe="${AWKQ%.awk}"-fzf.awk # AWKQ fuzzy/exact search with fzf
 AWK4="${TMPD}/.saveflt.awk" # filters saved items
+TTLF="${TMPD}/.titles" # source titles
 HSTF="${TMPD}/.hist-FNR.sh"; >"${HSTF}" # global command line history
 FCSF="${TMPD}/.fcs"; >"${FCSF}" # triggers varSEARCH focus grabber
 F2SF="${TMPD}/.f2s"; >"${F2SF}" # varCMD/varSEARCH focus cycler
@@ -91,8 +128,9 @@ F4SF="${TMPD}/search-output" # saved items
 RWMF="${TMPD}/.msg_restart" # RESTART_WINDOW message
 ETAP="${TMPD}/.eta"; >"${ETAP}" # tap invocation event
 FNRRPC="${TMPD}/.rpc"; >"${FNRRPC}" # remote procedure call mailbox
-SEP=`echo -e "\b"` # field separator of packed values
-XDGHOMEICONS="${HOME}/.icons" # freedesktop.org standard user's icon location
+YPID="${TMPD}/.pidof_yad_progress"; >"${YPID}" # yad --progress PID
+SEP=`printf '\b'` # field separator of packed values
+SVAR="${TMPD}/.vars-" # set_REFRESH_SOURCE_VARS_FOR_INPUT_FILE
 
 # -----------------------------------------------------------------------------
 #LANG=de_DE.UTF-8 # just for demo
@@ -100,22 +138,48 @@ LR=${LANG%.*} #ex:pt_BR
 LL=${LANG%_*} #ex:pt
 
 # -----------------------------------------------------------------------------
-# Unexport these variables before running the selected tap-command.
-UNEXPORT="unset GUI_ABOUT varSEARCH varFOCUSGRABBER varCMD varCOMMENT varOPEN varICONS varFOCUSSEARCH varF2 TEXTDOMAIN OUTPUT_CHARSET"
-# unset varLIST and varF3 separately
+
+command -v gtkdialog4 >/dev/null 2>&1 && GTKDIALOG=gtkdialog4 || GTKDIALOG=gtkdialog
+# GTKDIALOG_MAX_BYTE_LEN_BUG prevents a tree widget buffer overflow bug. If we
+# pass gtkdialog a longer buffer(*) it displays two rows: the buffer row then
+# an extra, empty row. Activating that latter crashes gtkdialog. To stay clear
+# of the bug we truncate longer buffers before feeding them to the tree widget.
+# (*) Note that it is a buffer-size limit as opposed to a string-size limit.
+# Multi-character strings may yield a string length below the limit but a byte
+# length over the limit. Unfortunately, shell e gawk do not provide built-ins
+# to determine the byte-length of a string, so we need to approximate some
+# limit calculations erring on the safe side (search for {APPROX_SAFE_SIDE}).
+GTKDIALOG_MAX_BYTE_LEN_BUG=510
+
+# Variables to be unexported before running tap-command. [[[1
+# Applies to drain-command, save-filter-command and init-command too.
+# Cf. usr/share/findnrun/doc/plugin-dev.md for terminology.
+# 1. These vars would "pollute" the *-command's env because they are truly exported.
+# varICONS and varFOCUSSEARCH shouldn't be unexported before gtkdialog starts.
+UNEXPORT=unset
+UNEXP_GUI1="varSEARCH varFOCUSGRABBER varCMD varCOMMENT varOPEN varICONS varFOCUSSEARCH varF2 TEXTDOMAIN OUTPUT_CHARSET GUI_ABOUT RESTART_WINDOW HELPINDEX"
+UNEXP_GUI2="varLIST varF3" # in some cases they can be unexported but only at a later stage
+UNEXP_NOT_TAP="SEARCHFUZZY CASEDEPENDENT SEARCHCOMMENTS SEARCHCATEGORIES SEARCHFILENAMES" # for set_INVOKE* except TAP
+UNEXP_INVK="invokeTAP invokeDRAIN" # not sure about these
+# 2. plugin-dev.md says these vars are part of the invocation environment therefore
+# they shouldn't be unexported (technically they are set but not exported).
+#UNEXP_PLUGIN="ID NSOURCES THISFILE"
+#UNEXP_SOURCE="TAP DRAIN ICON TITLE INITSEARCH MODE PLGDIR SAVEFLT INIT"
 
 # Prepare the configuration file. [[[1
-# Defaults - match same variable/value pairs in the next block. [[[2
-# Leave alone the next three configuration values for historical reasons.
+TIMER1=$(date +%s.%N)
+# Legacy default options - see var/value pairs in the next block. [[[2
+# Don't change for historical reasons.
 defOPEN=false
 export varICONS=false
 export varFOCUSSEARCH=false
 
 # Read / supplement $CONFIG. [[[2
 [ -e "$CONFIG" ] || > "$CONFIG"; . "$CONFIG"
-# Add missing/hidden defaults.
-# Define and initialize ALL configuration values here.
-gawk '
+# Add missing/hidden default settings.
+# Define and initialize ALL configuration settings here.
+gawk '#[[[gawk
+# look for existing settings [[[
 /^ICONCACHE=/{f1=1}
 /^SEARCHCOMMENTS=/{f2=1}
 /^SEARCHFROMLEFT=/{f3=1}
@@ -125,7 +189,8 @@ gawk '
 # DESKTOP_FILE_DIRS initialized from system values, environment overrides
 # ICON_DIRS initialized from system values, environment overrides
 /^SEARCHCATEGORIES=/{f6=1}
-/^SEARCHCOMPLETE=/{f7=1}
+#version 3.1 changed SEARCHCOMPLETE to an INTERNAL variable
+#/^SEARCHCOMPLETE=/{f7=1}
 /^IBOL=/{f8=1}
 /^HOTKEY_F2=/{f9=1}
 /^HOTKEY_F3=/{f10=1}
@@ -134,18 +199,70 @@ gawk '
 /^SHOWNODISPLAY=/{f13=1}
 /^SEARCHFILENAMES=/{f14=1}
 /^HOTKEY_F4=/{f15=1}
-END{ # Follow desired configuration file order
+/^HOTKEY_F5=/{f16=1}
+/^GTK_ICON_THEME_NAME=/{f17=1}
+/^SEARCHFUZZY=/{f18=1}
+/^FUZZY_MATCH_FIELD_BONUS=/{f19=1}
+/^HOTKEY_F6=/{f20=1}
+/^TERMINAL_PROGRAM=/{f21=1}
+/^CHECK_FZF=/{f22=1}
+#]]]
+END{ # lookup GTK2 icon theme name [[[
+    # TODO implement GTK3 lookup
+  if(!f17) {
+    delete RESULT; CURR = 0
+    include("'"$HOME/.gtkrc-2.0"'", 0)
+    GTK_ICON_THEME_NAME = CURR ? RESULT[CURR] : ""
+  }
+} #]]]
+function include(file,   s, A, p) { #[[[
+  if(top > 15) {
+    print "Error: Recursion too deep in", file > "/dev/stderr"
+    exit(1)
+  }
+  if(1 != index(file, "/")) { # resolve relative path
+    # TODO implement $GTK_PATH https://developer.gnome.org/gtk3/3.1/gtk-running.html
+    # https://developer.gnome.org/gtk2/stable/gtk-running.html
+    file = "'"$HOME"'/" file
+  }
+  while(0 < (getline s < file)) {
+    sub(/^[[:space:]]*/, "", s)
+    if(1 == index(s, "#")) {
+      continue
+    } else if(match(s, /^include[[:space:]]+"([^"]+)"/, A)) {
+      p = A[1]
+      if(match(p, "/themes/([^/]+)/", A)) { # presumably p is a theme file
+        # its folder name is also its icon theme name
+        RESULT[++CURR] = A[1]
+      }
+      include(p)
+    } else if(match(s, /^gtk-icon-theme-name[^"]+"([^"]+)"/, A)) {
+        RESULT[++CURR] = A[1]
+    }
+  }
+  close(file)
+} #]]]
+END{ # create config file and add missing settings [[[
+  # Follow desired configuration file order
   # Hotkey format: accel-mods":"key-sym":"accel-key
   # cf. https://github.com/01micko/gtkdialog/blob/wiki/menuitem.md
+  if(!f21) print "TERMINAL_PROGRAM=\"defaultterm\"">>ARGV[1]
+  if(!f22) print "CHECK_FZF=true">>ARGV[1]
   if(!f9) print "HOTKEY_F2=\"0:F2:0xffbf\"">>ARGV[1]
   if(!f10) print "HOTKEY_F3=\"0:F3:0xffc0\"">>ARGV[1]
   if(!f15) print "HOTKEY_F4=\"0:F4:0xffc1\"">>ARGV[1]
+  if(!f16) print "HOTKEY_F5=\"0:F5:0xffc2\"">>ARGV[1]
+  if(!f20) print "HOTKEY_F6=\"0:F6:0xffc3\"">>ARGV[1]
   if(!f11) print "HOTKEY_F12=\"0:F12:0xffc9\"">>ARGV[1]
-  if(!f1) print "ICONCACHE=\"'"${XDGHOMEICONS}"'\"">>ARGV[1]
+  if(!f17 && GTK_ICON_THEME_NAME) print "GTK_ICON_THEME_NAME=\""GTK_ICON_THEME_NAME"\"">>ARGV[1]
+  if(!f1) print "ICONCACHE=\"'"${HOME_ICONS_LEGACY}"'\"">>ARGV[1]
+  if(!f19) print "FUZZY_MATCH_FIELD_BONUS=\"0.3 0 0 0.5\"">>ARGV[1]
+  if(!f18) print "SEARCHFUZZY=false">>ARGV[1]
   if(!f14) print "SEARCHFILENAMES=false">>ARGV[1]
   if(!f2) print "SEARCHCOMMENTS=false">>ARGV[1]
   if(!f6) print "SEARCHCATEGORIES=false">>ARGV[1]
-  if(!f7) print "SEARCHCOMPLETE=true">>ARGV[1]
+#version 3.1 changed SEARCHCOMPLETE to an INTERNAL variable
+#  if(!f7) print "SEARCHCOMPLETE=true">>ARGV[1]
   if(!f3) print "SEARCHFROMLEFT=false">>ARGV[1]
   if(!f4) print "SEARCHREGEX=false">>ARGV[1]
   if(!f5) print "CASEDEPENDENT=false">>ARGV[1]
@@ -155,26 +272,52 @@ END{ # Follow desired configuration file order
   if(!f8) printf "IBOL=\"%c\" # reserved\n", 0xAD >>ARGV[1] # requires gawk
   # Built-in sources - space separated list
   if(!f12) print "SOURCES=\"FNRstart FNRsc\"">>ARGV[1]
-}
-' "${CONFIG}" && . "$CONFIG"
+} #]]]
+#gawk]]]' "${CONFIG}" && . "$CONFIG"
+if ! command -v "$TERMINAL_PROGRAM" >/dev/null 2>&1; then
+  ls "$TERMINAL_PROGRAM"
+  exit 1
+fi
+#version 3.1 changed SEARCHCOMPLETE to an INTERNAL variable
+[ "$SEARCHFILENAMES${SEARCHCOMMENTS}$SEARCHCATEGORIES" = truetruetrue ] &&
+  SEARCHCOMPLETE=true || SEARCHCOMPLETE=false
+# SEARCHDEFAULT is internal too.
+case "$SEARCHFUZZY$SEARCHREGEX" in *true*) SEARCHDEFAULT=false;; *) SEARCHDEFAULT=true;; esac
+export SEARCHFUZZY CASEDEPENDENT SEARCHCOMMENTS SEARCHCATEGORIES SEARCHFILENAMES # reminder: add to UNEXP_NOT_TAP
+export FNRSEARCHENGINE=${FNRSEARCHENGINE:-fzf} # susbstitute "v1" for the built-in engine
+export FNRFZF
+set_FNRFZF() # [[[
+{
+  FNRFZF="${0%/*}"/../share/$SN/bin/fzf # from install_fzf() on first start
+  ! [ -x "$FNRFZF" ] && FNRFZF=$(command -v fzf) # the one in PATH, if any
+  ! [ -x "$FNRFZF" ] && unset FNRFZF
+} # ]]]
+set_FNRFZF
 
-# Values that depend on defaults.
-# Icons [[[2
+[ "$DEBUG1" ] && TIMER2=$(date +%s.%N) && timer $TIMER1 $TIMER2 $TIMER0 "+processing $CONFIG" >&2
+
+# Icon paths [[[1
 # Note [ANCHOR_ICON_PATH]:
-# For XDG/GTK to be able to find icons in a non-standard icon path,
-# the path must end in '/icons' and XDG_DATA_DIRS must include the
-# parent folder path. Gtkdialog window icons (attribute icon-name)
-# must be copied to '/icons/hicolor/32x32/apps/'
-# Findnrun copies a plugin $ICON in gawk function try_store_source().
+# For XDG/GTK to be able to find icons located in non-standard icon paths, each
+# path must end in '/icons' and its parent must be listed in $XDG_DATA_DIRS.
+# https://specifications.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html#directory_layout
+# Findnrun's "icon work-around" (WA) code creates an intermediate directory
+# structure ($ICONCACHE) and symlinks the Gtkdialog main window icon (attribute
+# icon-name) and plugin-declared ICONs into $ICONCACHE as needed to fulfill the
+# XDG/GTK requirement. Cf. gawk function try_store_source().
 XDG_DATA_DIRS="${XDG_DATA_DIRS}:${TMPD}" # for plugin ICONS
 if [ -z "${ICONCACHE}" ]; then
-  ICONCACHE="${XDGHOMEICONS}"
+  # This value is also set in file $CONFIG for setting f1
+  ICONCACHE="$HOME_ICONS_LEGACY"
 else
   XDG_DATA_DIRS="${XDG_DATA_DIRS}:${ICONCACHE}"
   ICONCACHE="${ICONCACHE}/icons"
 fi
-# Prefix to worked-around icons.
-ICONSTEM="${ICONCACHE}/findnrun-" # NOT a dirpath
+
+# Prefix and stem path for the "icon work-around" (WA) icons.
+# The prefix aims at ensuring a unique icon name match across all elements of $ICON_DIRS.
+CACHEFILEPREFIX="findnrun___"
+ICONSTEM="$ICONCACHE/$CACHEFILEPREFIX" # NOT a dirpath
 ICONSTEM2="${TMPD}/icons/" # slash-terminated, for plugin ICONS
 ICONSTEM2A="${ICONSTEM2}/hicolor/scalable/apps/" # ditto
 mkdir -p "${ICONCACHE}" "${ICONSTEM2}" "${ICONSTEM2A}"
@@ -196,56 +339,64 @@ while ! [ "${1#--}" = "$1" ]; do
   shift
 done
 
-# Initialize more variables [[[1
-# Some environment variables may affect operations:
-# BROWSER, GEOMETRY, LANG, XCLIP, and more.
-
-which gtkdialog4 >/dev/null 2>&1 && GTKDIALOG=gtkdialog4 || GTKDIALOG=gtkdialog
-
 # Declare built-in sources. [[[1
 # $BUILTIN_SOURCES get special treatment
 # pipe-separated list
 BUILTIN_SOURCES="FNRstart|FNRsc"
 
 # Built-in save-filter-command. [[[2
-FNRSAVEFLT="gawk -f \"$AWK4\""
-# usage:
-#   SAVEFLT_<source-id>="CUT\"=i,j,k,...\" RDR="redirection" \$FNRSAVEFLT \"${file}\""
-# CUT and RDR explained at script AWK4 - see examples for FNRstart and Filmstrip source.
+FNRSAVEFLT="gawk -f \"$AWK4\"" # usage is given at awk script AWK4
 
-# save-filter-command setup for built-in sources. [[[2
-# If xclip command exists then copy stdout to clipboard else to awk's stderr.
-# User preference XCLIP can override/disable clipboard copying.
-if [ -z "$XCLIP" ]; then
-  XCLIP=$(which xclip 2>/dev/null)
-  [ -e "$XCLIP" ] && XCLIP="|$XCLIP"
-fi
-if [ -z "$XCLIP" -o none = "$XCLIP" ]; then
-  XCLIP=">/dev/stderr"
-fi
+# FNRstart - Default built-in source "Application Finder" [[[2
+SOURCE_FNRstart="FNRstart::FNRstart:FNRstart:FNRstart:::FNRstart:FNRstart"
+# INIT is run once only, on the first time this gtkdialog invokes this source.
+# The single invocation code generator can be found at {INVOKEINIT}.  Gist
+# below: Up to "f >..." create a list of .desktop file paths. Then gawk -f
+# AWKB outputs the .desktop db given the paths. Then echo NDATF appends NDATF
+# to the source declaration file (THISFILE).  The subsequent TAP's gawk -f AWK{Q,Z}
+# queries the .desktop db on each search box keypress.
+INIT_FNRstart="p=\"$DESKTOP_FILE_DIRS\"; f(){ local IFS=:; find -L \$p -type f -name \\*.desktop 2>/dev/null; :;}; f >\"$DSKL\"; gawk -f \"${AWKB}\" -v ALL_ICONS=${varICONS} -v SHOWNODISPLAY=${SHOWNODISPLAY} -v DSKL=\"$DSKL\" > \"${DATF}\"; echo NDATF=\"'\$(wc -l < \"${DATF}\")'\" >> \"\$THISFILE\""
+# $TAP_FNRstart is also used as the body of function FNRsearch defined by $INVOKE_SOURCE_TAP.
+TAP_FNRstart="if [ fzf = \$FNRSEARCHENGINE -a \"\$FNRFZF\" ]; then q=\"$AWKZe\"; else [ true = \$SEARCHFUZZY ] && q=\"$AWKZ\" || q=\"$AWKQ\"; fi;"\
+"gawk -f \"\$q\" -v GREP=\"\${term}\" \"\${DATF:-$DATF}\"${REDIRECT2}"
+TITLE_FNRstart=$i18n_application_finder
+ICON_FNRstart='findnrun' # Also used as FALLBACK_ICON for all missing app icons.
+SAVEFLT_FNRstart="\$FNRSAVEFLT CUT=\"$CUT\" RDR=\"$RDR\" \"\${file}\""
+# Why is the default fallback icon not displayed? Possibly because findnrun was
+# started in a directory in which file 'findnrun' exists, which confuses
+# icon_wa_match_and_link() when it tests for existence of file $FALLBACK_ICON.
+# Then it doesn't enter the code block that searches for the actual
+# $FALLBACK_ICON file full pathname. Fix: start findnrun in another directory.
+[ -e "$ICON_FNRstart" ] &&
+  echo "Warning [DEV]: File ./$ICON_FNRstart exists and shadows the DEFAULT_FALLBACK icon file. Please 'cd' elsewhere." >&2
 
-# Default built-in source "Desktop Apps" [[[2
-SOURCE_FNRstart="FNRstart::FNRstart:FNRstart:FNRstart:::FNRstart"
-TAP_FNRstart="gawk -f \"${AWKQ}\" -v GREP=\"\${term}\" \"${DATF}\"${REDIRECT2}"
-TITLE_FNRstart=$(gettext "application finder")
-ICON_FNRstart='/usr/share/doc/findnrun/findnrun.svg' # Filmstrip plugin expects.
-# save item label, .desktop file fullpath, exec line, comments, categories
-SAVEFLT_FNRstart="CUT=\"-4,1,3,4,5\" RDR=\"\$FNRXCLIP\" \$FNRSAVEFLT \"\${file}\""
-
-# Built-in source "Shell Completion" [[[2
-SOURCE_FNRsc="FNRsc::FNRsc:FNRsc:FNRsc:::FNRsc"
-[ true = "${CASEDEPENDENT}" ] && unset i || i=i
-x="${TMPD}/.FNRsc"; mkdir "$x" &&
+# FNRsc - Built-in source "Shell Completion" [[[2
+SOURCE_FNRsc="FNRsc::FNRsc:FNRsc:FNRsc:::FNRsc:FNRsc"
 # Embedded newline characters not allowed.
-TAP_FNRsc="t='$x/.dat';"' if ! [ -s "$t" ]; then set +f; IFS=:; for i in $PATH; do { cd "$i" && ls -1 *"${term}"* ;} 2>/dev/null; done | findnrun-formatter -- -O su | tee "$t"; else grep -F'$i' "${term}" "$t"; fi;'
-ICON_FNRsc='/usr/share/doc/findnrun/FNRsc.svg'
-TITLE_FNRsc=$(gettext "shell completion")
-# save item label == exec line
-SAVEFLT_FNRsc="CUT=\"-4\" RDR=\"\$FNRXCLIP\" \$FNRSAVEFLT \"\${file}\""
+ICON_FNRsc='findnrun_sc'
+INIT_FNRsc='FNRset_TMPD_DATF; set +f; ifs=$IFS; IFS=:; for d in $PATH; do cd "$d" && ls -1 *"${term}"*; done 2>/dev/null | findnrun-formatter -- -I '"$ICON_FNRsc"' -O su >"$DATF"; IFS=$ifs'
+TAP_FNRsc='FNRset_TMPD_DATF; FNRsearch'
+TITLE_FNRsc=$i18n_shell_completion
+# save item label(-4) == exec line(3)
+SAVEFLT_FNRsc="\$FNRSAVEFLT CUT=\"-4\" RDR=\"$RDR\" \"\${file}\""
 
-# Prepare sources. [[[1
-# Don't change next two formats; functions generate_invoke*()
-# assume them, and so may also findnrun-formatter in the future.
+# Public Helpers [[[1
+set_Helper_Functions() # [[[2
+{
+  # Cf. usr/share/findnrun/doc/plugin-dev.md "Helper Functions"
+
+  FNRset_TMPD_DATF=\
+'FNRset_TMPD_DATF(){ TMPD="'"$TMPD"'/.${1:-$ID}" && ! [ -d "$TMPD" ] && mkdir -p "$TMPD" && chmod 700 "$TMPD"; DATF="$TMPD"/.dat; }'
+  FNRsearch=\
+'FNRsearch(){ '"$TAP_FNRstart"'; }'
+}
+#]]]
+set_Helper_Functions
+
+# Compile built-in and plugin sources. [[[1
+TIMER1=$(date +%s.%N)
+# Don't change next two formats without mirroring them in functions set_INVOKE*
+# and possibly also in findnrun-formatter.
 SRCSTEM="${TMPD}/.source-" # prefix to source filenames
 SRCFMT='%d-%s.sh' # source filename format, i.e., printf "%s${SRCFMT}" "${SRCSTEM}" 0 FNRstart
 store_valid_sources() # [[[
@@ -264,6 +415,7 @@ store_valid_sources() # [[[
 # 102 null tap-command
 # 103 invalid tap-command sh syntax
 # 104 invalid drain-command sh syntax
+# 105 invalid init-command sh syntax
 # 111 broken tap-id (leads nowhere)    TODO 111 and up
 # 112 broken drain-id
 # 113 broken title-id
@@ -276,17 +428,19 @@ store_valid_sources() # [[[
 # 206 unreferenced INITSEARCH_
 # 207 unreferenced MODE_
 # 208 unreferenced PLGDIR_
-# 208 unreferenced SAVEFLT_
+# 209 unreferenced SAVEFLT_
+# 210 unreferenced INIT_
 #]]]
 # i18n Source plugin validation.
   set | gawk -v SOURCES="${SOURCES}" -v BUILTIN="${BUILTIN_SOURCES}" \
-    -v MSG1="$(gettext "fatal source error: %d%s\n")" \
-    -v MSG2="$(gettext "recoverable source error: %d%s\n")" \
-    -v MSG3="$(gettext "source warning: %d%s\n")" \
-'#!/usr/bin/gawk -f
+    -v PUBLIC_HELPERS="$FNRset_TMPD_DATF" \
+    -v MSG1="${i18n_fatal_source_error}\n" \
+    -v MSG2="${i18n_recoverable_source_error}\n" \
+    -v MSG3="${i18n_source_warning}\n" \
+'#[[[gawk
 BEGIN {
   TEXTDOMAIN="'"${TEXTDOMAIN}"'"
-  if('${DEBUG1:-0}') print "\n=== PROCESS SOURCE DECLARATIONS (set FNRDEBUG= 3-5 for more)" > "/dev/stderr"
+  if('${DEBUG1:-0}') print "\n=== COMPILE SOURCE DECLARATIONS (set FNRDEBUG=3-5 for more)" > "/dev/stderr"
   # Invalid SOURCES syntax? 101 [[[
   nE = split(SOURCES, E)
   for(j=1; j <= nE; j++) {
@@ -301,52 +455,85 @@ BEGIN {
   # Fall back to BUILTIN source.
   if("" == valid_sources) valid_sources = "FNRstart"
   #]]]
-  # id types
-  ordered_G = "SOURCE|TAP|DRAIN|ICON|TITLE|INITSEARCH|MODE|PLGDIR|SAVEFLT"
-  # G[] array of types
+  # Here we declare input tokens and their attributes [[[
+  ordered_G = "SOURCE|TAP|DRAIN|ICON|TITLE|INITSEARCH|MODE|PLGDIR|SAVEFLT|INIT"
   nG = split(ordered_G, G, /\|/)
-  pattern = "^("ordered_G")_([^=]+)=(.*)"
+  pattern = "^("ordered_G")_([^=]+)=(.*)" # => yields a[1] a[2] a[3]
+  # The following are considered "shell code" while the remaining members of
+  # ordered_G are considered "literal labels" or "simple assignaments". This
+  # matters for quote handling, as explained in NOTES ABOUT QUOTE HANDLING.
+  IsCode["TAP"]   = 103
+  IsCode["DRAIN"] = 104
+  IsCode["INIT"]  = 105
+  IsCode["SAVEFLT"] = 106
+  # ]]]
 }
 {
   if(match($0, pattern, a)) {
     # Parse declarations [[[
-    # I[] array of any-type ids a[2]
-    # S[] array of source-ids a[1] contained in I[]
-    # VGI[] values a[3] by (group a[1], id a[2])
+    # In .findnrnrc we have: (LHS) <type>'_'<name>'='<value> (RHS)
+    # and in particular:    'SOURCE_'<source-name>'='<name>[':'<name-ref>|<value>...]
+    # G[] array of possible LHS types a[1] (aka groups), index numeric
+    # I[] array of parsed LHS type-names a[2] (aka ids), index type-name
+    # S[] array of parsed LHS source-names a[2] (aka sources), I[] contains S[], index source-name
+    # VGI[] array of parsed RHS values a[3], indices type,name a[1],a[2]
     I[a[2]] = a[2]
     if("SOURCE" == a[1]) S[a[2]] = a[2]
-    # Assert: Input stream ("set |") single quoted all values.
-    # Note the difference between ash and bash: bash "env" single quotes
-    # just the values that include spaces, while ash "env" single
-    # quote all values regardless. So we strip exterior single quotes
-    # conditionally to keep compatibility with both shells.
-    VGI[a[1], a[2]] = unquote(a[3])
+
+    # NOTES ABOUT QUOTE HANDLING: [[[
+    # Stdin comes from "set |" and consists of lines in the form
+    # <shell identifier>=[<sq>]<word>[<word>...][<sq>]
+    # <sq> is a single quote in ash, dash and bash. However, ash and bash omit
+    # <sq> if there is only one <word>.
+    # For literal groups, i.e, TITLE, MODE, etc. we trim <sq>, see {UNQUOTE} below.
+    # For groups that contain shell code (IsCode) we never change the data.
+
+    # For groups in IsCode, if <word> contains a single quote character \x27,
+    # i.e.  "A\x27B", `set` could output either \x27A\x27\\\x27\x27B\x27 or
+    # \x27A\x27"\x27"\x27B\x27, depending on the shell.  A plugin that aims to
+    # be compatible with the three shells should avoid using single quotes and
+    # use exterior double quotes and escaped interior double quotes if
+    # necessary.
+    #
+    # Attention plugin authors: Older shell versions output single quotes
+    # differently, so the new shell versions might have broken compatibility
+    # with older findnrun plugins, which should be updated to use (possibly
+    # escaped interior) double quotes instead of single quotes.
+    # ]]]
+
+    VGI[a[1], a[2]] = (a[1] in IsCode) ? a[3] : unquote(a[3])
     if('${DEBUG5:-0}') print a[1],"**",a[2],"**",a[3] > "/dev/stderr"
     #]]]
   }
 }
 END {
-    if('${DEBUG4:-0}') {
-      printf "# I:" >"/dev/stderr"; for(i in I) printf(" %s", i) >"/dev/stderr"
-      print "" >"/dev/stderr"
-      printf "# S:" >"/dev/stderr"; for(s in S) printf(" %s", s) >"/dev/stderr"
-      print "" >"/dev/stderr"
-      for(i in I) {
-        for(j=1; j<=nG; j++) {
-          g = G[j]
-          if((g, i) in VGI)
-            printf("# <%s, %s> = %s\n", g, i, VGI[g, i]) >"/dev/stderr"
-        }
+  if('${DEBUG3:-0}') {
+    print  "# Builtin sources:", BUILTIN >"/dev/stderr"
+    print  "# Active sources :", SOURCES >"/dev/stderr"
+    printf "# All LHS Ids    :" >"/dev/stderr"; for(i in I) printf(" %s", i) >"/dev/stderr"
+    print "" >"/dev/stderr"
+    printf "# All LHS Sources:" >"/dev/stderr"; for(s in S) printf(" %s", s) >"/dev/stderr"
+    print "" >"/dev/stderr"
+  }
+  if('${DEBUG4:-0}') {
+    for(i in I) {
+      for(j=1; j<=nG; j++) {
+        g = G[j]
+        if((g, i) in VGI)
+          printf("# <%s, %s> = %s\n", g, i, VGI[g, i]) >"/dev/stderr"
       }
     }
-  # TS[] array of tap-ids by source-id
-  # DS[] array of drain-ids by source-id
+  }
+  # TS[] array of tap-ids, index source-id
+  # DS[] array of drain-ids, index source-id
   for(s in S) {
     split(VGI["SOURCE",s], a, /:/)
-    if(a[1]) TS[s] = a[1] # TODO should use symbols, not number
-    if(a[2]) DS[s] = a[2] # ditto
-    # Localize title; ditto
+    # TODO next three lines, index a[] by symbol instead of position
+    if(a[1]) TS[s] = a[1]
+    if(a[2]) DS[s] = a[2]
+    # Get title translation, if any in TEXTDOMAIN "findnrun-plugin-"<source-name>
     if(a[4]) VGI["TITLE", a[4]] = dcgettext(VGI["TITLE", a[4]], "findnrun-plugin-"s)
+
     if('${DEBUG5:-0}')
       printf "source %s: TAP %s DRAIN %s\n", s, \
         (s in TS) ?TS[s] :"NULL", (s in DS) ?DS[s] :"NULL" >"/dev/stderr"
@@ -357,11 +544,10 @@ END {
     delete S[s]
   }
   #]]]
-  # Invalid tap-command sh syntax? 103 [[[
-  syntax_check("TAP", TS, S, 103) # deletes elements of S
-  #]]]
-  # Invalid drain-command sh syntax? 104 [[[
-  syntax_check("DRAIN", DS, S, 104) # deletes elements of S
+  # Invalid shell code syntax? [[[
+  for(g in IsCode) {
+    syntax_check(g, TS, S, IsCode[g]) # deletes elements of S
+  }
   #]]]
   # Store remaining valid sources for gtkdialog shell. [[[
   # Treat sources as an ordered list.
@@ -380,14 +566,16 @@ END {
   for(x = 0; x <= 2; x++) {
     bin[x] = substr(bin[x], 2)
     nbin[x] = split(bin[x], source)
-    # Output enabled (visible/hidden) sources only.
+    # Output enabled (visible/hidden) sources only, each to its own file.
+    # Insert THISFILE= path of output file, NSOURCES= number of visible sources.
     if(x != 0x1) {
       for(j = 1; j <= nbin[x]; j++) {
         buf = Store[source[j]]
-        p = index(buf, "\n")
+        p = index(buf, "\n") # THISFILE \n its lines
         saveas = substr(buf, 1, p-1)
-        # While saving source to disk add NSOURCES= number of visible sources
-        printf("%s\nNSOURCES='"'%d'"'\n", substr(buf, p+1), nbin[0]) > saveas
+        printf("%s%sTHISFILE='"'%s'"'\nNSOURCES='"'%d'"'\n%s\n",\
+          '${DEBUG2:-0}' ?("echo >&2 Reading \""saveas"\"${SKIP_INIT:+ and skipping INIT}...\n") :"",\
+          title, saveas, nbin[0], substr(buf, p+1)) > saveas
         close(saveas)
       }
     }
@@ -397,10 +585,11 @@ END {
   for(j = 0; j <= 2; j++) printf("%d:%s:", nbin[j], bin[j])
   printf "\n"
 }
-function syntax_check(group, A, I, code,   i, checker, status) { # [[[
+function syntax_check(group, A, I, err_code,   shell_code, i, checker, status) { # [[[
   # Checks all items of A. Deletes items of I.
 
-  # The best syntax checker that we can get, but still quite limited.
+  # "sh -n" is quite a limited syntax checker but it is built-in.
+  # https://www.shellcheck.net/ is much better.
   checker = "sh -n"
 
   if('${DEBUG4:-0}') { #[[[
@@ -413,19 +602,27 @@ function syntax_check(group, A, I, code,   i, checker, status) { # [[[
   #   If source-id i is still in the set of valid ids (I)
   #   && its group-id A[i] has an associated value in VGI...
   for(i in A) if(i in I && ((group, A[i]) in VGI)) {
-    if(match(BUILTIN, i)) continue # optimization: skip built-in sources
+    '${DEBUG1:-"if(match(BUILTIN, i)) continue"}' # optimize: skip built-in sources if not debugging
+    if(!match(SOURCES, i)) continue # optimize: skip inactive sources
+    # Note: if A`s tap references B`s tap and B is inactive, A`s tap [[[
+    # won`t be validated/available. The work-around is to declare B
+    # as an active source, but hide it with MODE HIDDEN. ]]]
+    shell_code = VGI[group, A[i]]
     if('${DEBUG4:-0}') #[[[
-      print "now checking",i"'"'"'s", group, A[i],"=>", \
-        VGI[group, A[i]] >"/dev/stderr" #]]]
-    print VGI[group, A[i]] | checker
-    if(close(checker)) { # non-zero exit code on invalid syntax
-      recoverable(code, group": "VGI[group, A[i]], i)
+      print "now checking",i"'"'"'s", group, A[i],"=>",shell_code >"/dev/stderr"
+    #]]]
+    # The shell_code we get is formatted as a (quoted) shell string because it
+    # comes from "set |". So we echo it to turn it into plain text for the
+    # checker to validate.
+    if(system("echo " shell_code " | " checker)) {
+      # non-zero exit code means invalid syntax, disable this source
+      recoverable(err_code, group": "shell_code, i)
       delete I[i]
     }
   }
 }
 #]]]
-function try_store_source(s, S, Store, buf, A,   a, g, i, j, I, iconpath, cachedpath) { #[[[
+function try_store_source(s, S, Store, buf, A,   a, g, i, j, I, iconpath, cachedpath, rval, title, mode) { #[[[
   # try_store_source stores BY REFERENCE in map Store the current
   # source s unless the source "disabled" bit is on.
   # Upon storing s, try_store_source increments global static variable _global_try_store_source.
@@ -434,72 +631,93 @@ function try_store_source(s, S, Store, buf, A,   a, g, i, j, I, iconpath, cached
   # In => Out: (all output values are wrapped in SINGLE quotes)
   #   s      source-id
   #   S      global array of valid source ids
-  #   Store  return array of composed sources
-  #   buf==""      => compose from globals G and VGI for s; OR
-  #   buf=="array" => compose from A["SOURCE"]=source-id, A["TAP"]=tap-command, ...
+  #   Store  return array of assembled sources
+  #   buf==""      => assembled from globals G and VGI for s; OR
+  #   buf=="array" => assembled from A["SOURCE"]=source-id, A["TAP"]=tap-command, ...
   #   A    see buf="array"
+  #   rval   current RHS unquoted value (output)
   # Return value: 0:enabled-in-Store 1:disabled 2:hidden-in-Store
 
-  # Assert: The calling outer loop has stripped all exterior single quotes.
+  # Assert: The calling outer loop has stripped exterior single quotes
+  # except for shell code values (IsCode). See {UNQUOTE} above.
   if("" == buf) {
     buf = sprintf("ID='"'%s'"'", s)
     split(s":"VGI["SOURCE",s], I, /:/)
     for(j = 1; j <= nG; j++) {
       g = G[j]; i = (j in I) ?I[j] :"N\x08NULL" # \x08 => never "(g,i) in VGI"
       if('${DEBUG3:-0}') printf ("<%s, %s> ", g, i) > "/dev/stderr"
-      if((g, i) in VGI) {
-          buf = buf sprintf("\n%s='"'%s'"'", g, VGI[g, i])
-      } else { # the plugin does not declare a value for group id g
+      if((g, i) in VGI) { # parsed source_<g>roup=value and non-null value
+        if(g in IsCode) {
+          # do not change the value, see {UNQUOTE} above.
+          buf = buf sprintf("\n%s=%s", g, rval = VGI[g, i])
+          if("INIT" == g) { #{INVOKEINIT}
+            # Add shell code to run INIT once only. env SKIP_INIT=1 ... to skip.
+            buf = buf sprintf("\nif [ \"$INIT\" -a -z \"$SKIP_INIT\" ]; then\n%s\nfi",\
+              ('${DEBUG1:-0}' ?("__t0=$(date +%s.%N)\n") :"")\
+              PUBLIC_HELPERS"\n"\
+              "  eval $INIT\n"\
+              ('${DEBUG1:-0}' ?("__t1=$(date +%s.%N)\n") :"")\
+              ('${DEBUG1:-0}' ?("  awk -v fmt=\"\\033[7mINIT $ID %g ms elapsed\\033[0m\\n\" -v t0=$__t0 -v t1=$__t1 \x27""BEGIN {printf fmt, (t1-t0)*1000;exit}\x27 >&2\n") :"")\
+              "  sed -i \"$THISFILE\" -e \"s/^INIT=/DID_&/\"\n"  )
+          }
+        } else { # store quoted value
+          buf = buf sprintf("\n%s='"'%s'"'", g, rval = VGI[g, i])
+        }
+      } else { # parsed either source_<g>roup= or the source does not declare <g>
         if("TITLE" == g) {
           # on no title-id output source-id as title value
-          buf = buf sprintf("\n%s='"'%s'"'", g, s)
+          buf = buf sprintf("\n%s='"'%s'"'", g, rval = s)
         } else if("MODE" == g) {
           # on no mode-id output MODE="0" for bit mask
-          buf = buf sprintf("\n%s='"'%d'"'", g, 0)
+          buf = buf sprintf("\n%s='"'%d'"'", g, rval = 0)
         } else {
           # on no "other" id output null value, i.e., VAR="" << IMPORTANT
-          buf = buf sprintf("\n%s='"''"'", g)
+          buf = buf sprintf("\n%s='"'%s'"'", g, rval = "")
         }
       }
+      if("TITLE" == g) { title = rval }
+      else if("MODE" == g) { mode = rval }
     }
   } else if("array" == buf) { # NOT USED
     buf = sprintf("ID='"'%s'"'", s)
     for(a in A)
       buf = buf sprintf("\n%s='"'%s'"'", a, A[a])
   }
-  # Get MODE: [1] bit mask
-  match(buf, /MODE=\x27([^\x27]+)\x27/, a); mode = a[1]
   # Do not store the current source if MODE "disabled" bit (0x1) is set
   if(and(mode, 0x1)) {
-    if('${DEBUG3:-0}') print "\n!!! Plugin mode DISABLED [[\n"buf"\n]]" > "/dev/stderr"
+    if('${DEBUG3:-0}') print "\n!!! Plugin is DISABLED [[\n"buf"\n]]" > "/dev/stderr"
     return 1 # DISABLED source
   }
   # Else continue to store the current source
-  Store[s] = sprintf("%s\n%s", # filepath[.hide] + contents
+  Store[s] = sprintf("%s\n%s", # filepath[.hide] \n contents
     format_saveas(_global_try_store_source++, s, mode), buf)
   # Copy plugin icon, ref. note [ANCHOR_ICON_PATH] [[[
   # Get ICON: [1] fullpath, [2] dirname, [3] basename.
-  match(buf, /ICON=\x27(([^\x27]*\/)([^\x27]+))\x27/, iconpath)
-  if("" != iconpath[3]) {
-    # Cache the icon. Read why at [ANCHOR_ICON_PATH].
-    cachedpath = "'"${ICONSTEM2}"'" iconpath[3]
-    # For gtkdialog tree widget column icon.
-    printf("ln -sf \x27%s\x27 \x27%s\x27\n", \
-      iconpath[1], cachedpath) | SH_FOR_ICONS
-    # For gtkdialog window widget (attribute icon-name).
-    cachedpath = "'"${ICONSTEM2A}"'" iconpath[3]
-    printf("ln -sf \x27%s\x27 \x27%s\x27\n", \
-      iconpath[1], cachedpath) | SH_FOR_ICONS
+  match(buf, /ICON=\x27(([^\x27]*\/)?([^\x27]+))\x27/, iconpath)
+  # if ""!=$1!=$2 then found icon path elif ""!=$1==$2 then found icon name else found no icon.
+  if(iconpath[1] != "") {
+    if(iconpath[1] != iconpath[3]) { # icon path
+      # Cache the icon full filepath. Read why at [ANCHOR_ICON_PATH].
+      # For gtkdialog tree widget column icon.
+      printf("ln -sf \x27%s\x27 \x27%s\x27\n", \
+        iconpath[1], "'"${ICONSTEM2}"'" iconpath[3]) | SH_FOR_ICONS
+      # For gtkdialog window widget (attribute icon-name).
+      printf("ln -sf \x27%s\x27 \x27%s\x27\n", \
+        iconpath[1], "'"${ICONSTEM2A}"'" iconpath[3]) | SH_FOR_ICONS
+    } else { # icon name
+      #
+    }
   }
   #]]]
 
   if(and(mode, 0x2)) {
-    if('${DEBUG3:-0}') print "\n!!! Plugin mode HIDDEN [[\n"buf"\n]]" > "/dev/stderr"
+    if('${DEBUG3:-0}') print "\n!!! Plugin is HIDDEN [[\n"buf"\n]]" > "/dev/stderr"
     return 2 # HIDDEN source
-  } else {
-    if('${DEBUG3:-0}') print "\nPlugin is enabled [[\n"buf"\n]]" > "/dev/stderr"
-    return 0
   }
+
+  if('${DEBUG3:-0}') print "\nPlugin is enabled [[\n"buf"\n]]" > "/dev/stderr"
+  print title >> "'"$TTLF"'"
+  return 0
 }
 #]]]
 function format_saveas(num, name, mode,   saveas) { #[[[
@@ -522,13 +740,14 @@ function warning(code, subject, source) { #[[[
     (source ?" "source":" :"") (subject ?" "subject :"")) > "/dev/stderr"
 }#]]]
 function unquote(s,   p,t,l) { # [[[
+# Trim exterior, paired single quotes. See {UNQUOTE} above.
   if((p = index("\x27", t = substr(s,1,1))) && p < 2) {
     if(t == substr(s, l = length(s)))
       return(substr(s, 2, l-2))
   }
   return(s)
 }#]]]
-  '
+#gawk]]]'
 }
 #]]]
 list_diff() # $1-list1 $2-list2 [[[
@@ -547,56 +766,74 @@ x=$?; [ 0 -lt $? -a $? -lt 100 ] && exit $x # fatal errors
 ifs=$IFS; IFS=:
 read NSOURCES VISIBLE_SOURCES x DISABLED_SOURCES x HIDDEN_SOURCES x < "${TMPD}/.$$"
 IFS=$ifs
-# Initialize gtkdialog source defaults from the first source.
-. "${SRCSTEM}0-"*.sh
+[ "$DEBUG1" ] && TIMER2=$(date +%s.%N) && timer $TIMER1 $TIMER2 $TIMER0 "+compiling sources" >&2
+
+# Set default source to the first element of SOURCES. [[[1
+# Note: source with SKIP_INIT!="" not to expose findnrun's environmnet to the
+# init-command, which could see/change anything.
+SKIP_INIT=prefetch . "${SRCSTEM}0-"*.sh
 
 # Display warning dialog if some source declarations were found invalid. [[[
 invalid=$(list_diff "$SOURCES" "$VISIBLE_SOURCES $DISABLED_SOURCES $HIDDEN_SOURCES")
 if [ -n "$invalid" ]; then
-  # TODO display main window then Xdialog window over.
-  Xdialog --title "${APP_NAME}" --msgbox \
-    "$(printf \
-      "$(gettext 'Invalid source plugins found and disabled:\n%s')" \
-      "$invalid")" 0x0
+  yad --title "${APP_NAME}" --window-icon=edit-find --center --on-top \
+    --image gtk-dialog-warning --buttons-layout=center --borders=4 \
+    --button=gtk-ok \
+    --text "$(printf \
+      "$i18n_Invalid_source_plugins" \
+      "$invalid")"
 fi
 #]]]
-# Prepare the database builder script. [[[1
-# Usage: gawk -f "${AWKB}" [-v GREP="string"] [-v ALL_ICONS=true] [-v SHOWNODISPLAY=true|false] [-v LIST_FILE="list_file" | files ]
-# Specify input file names either as lines of LIST_FILE or as command arguments
-# The former style allows for handling read file errors gracefully.
-[ -x /bin/dash ] && SH=/bin/dash || SH=/bin/ash
-> "${AWKB}" echo '#!/usr/bin/gawk -f
+# Prepare the .desktop database builder script. [[[1
+# Usage: gawk -f "${AWKB}" [-v GREP="string"] [-v ALL_ICONS=true] [-v FALLBACK_ICON="icon-name-or-filepath"] [-v SHOWNODISPLAY=true|false] [-v DSKL="desktop-file-list" | desktop-files ]
+# Specify input files (.desktop) either as lines of DSKL or as awk arguments.
+# The former style allows for handling read file errors gracefully and is used throughout this script.
+[ -x /bin/dash ] && SH=/bin/dash || SH=sh
+> "${AWKB}" printf %s\\n '#[[[gawk
 BEGIN { # [[[2
-  if('${DEBUG1:-0}') print "\n=== DB BUILDER (set FNRDEBUG= 2 for more)\n[[ ALL_ICONS="ALL_ICONS >"/dev/stderr"
+  if('${DEBUG1:-0}') {
+    (__c = "date +%s.%N") | getline __t0; close(__c)
+    print "\n=== .desktop app db BUILDER (set FNRDEBUG=2 for more)\n[[ ALL_ICONS="ALL_ICONS >"/dev/stderr"
+  }
   RS="^~cannot~match~me~" # enable slurp read mode.
-  # Choose a shell for ongoing command execution - see icon_workaround().
-  sh = "'${SH}'" # not used as a coprocess
+  # Choose a shell for ongoing command execution - see icon_wa_match_and_link().
+  sh = "'${SH}'" # not used as a co-process
   ICONSTEM = "'"${ICONSTEM}"'" # prefix to worked-around icons.
+  UNIQUEPREFIX = "'"${CACHEFILEPREFIX}"'"
+  if("" == FALLBACK_ICON) { FALLBACK_ICON = "'"$ICON_FNRstart"'" }
   if('${DEBUG2:-0}') print "ICONSTEM="ICONSTEM >"/dev/stderr"
   if(""==SHOWNODISPLAY) SHOWNODISPLAY = "false"
-  MSG1="'"$(gettext "SHOWNODISPLAY false excludes file '%s'")"'"
-  MSG2="'"$(gettext "filename '%s': Icon '%s' not found.")"'"
+  MSG1="'"$i18n_SHOWNODISPLAY_false_excludes"'"
+  MSG2="'"$i18n_filename_Icon_not_found"'"
+  MSG3="'"$i18n_analyzing_applications"'"
   # Read files specified by list of file names.
-  if(LIST_FILE) {
-    NFILES = read_list_file(LIST_FILE, file)
+  if(DSKL) {
+    NFILES = read_list_file(DSKL, file)
     exit # go to END - skip main loop
   }
 }
 # main loop # [[[2
-# Read files specified by command line arguments.
+# Read .desktop files specified by command line arguments.
 # Use when you are certain that all files are readable.
 {
   # Slurp NFILES .desktop files.
   file[++NFILES]=";"FILENAME"\n"$0
 }
 END { # [[[2
-  # Is the icon work-around enabled and up-to-date?
-  if(ICONUPDATED = is_icon_workaround_uptodate()) {
-    # Speed up icon_workaround() by reading the icon index file.
+  # Is the icon work-around enabled and are its data up-to-date?
+  if(ICON_WA_READY = is_icon_wa_uptodate()) {
+    # Speed up icon search by reading the icon index file.
     read_icon_index() # creates ICONINDEX map
   }
   # Decode .desktop files.
   if('${DEBUG1:-0}') print "awk decoding",NFILES,"files..." > "/dev/stderr"
+  if(!ICON_WA_READY && "true"==ALL_ICONS && NFILES > 10) {
+    # show a progress gauge while re-building a big (>10) icon cache
+    PROGRESS_PID = show_progress_dialog(sprintf(MSG3, NFILES))
+  }
+  if(ALL_ICONS == "true") {
+    icon_wa_init()
+  }
   for(i=1; i<=NFILES; i++) {
     fil=file[i]
     name=exec=icnpath=icnname=icnext=comment=category=""
@@ -605,14 +842,14 @@ END { # [[[2
     if(match(fil, /\nName\[('"${LR:-@}|${LL:-@}"')\]=([^\n]+)/, m)) name=m[2]
     if(!name) continue # trap bogus .desktop files
     if(SHOWNODISPLAY != "true" && index(fil, "NoDisplay=true")) {
-      printf(MSG1"\n", filename) > "/dev/stderr"
+      if('${DEBUG1:-0}') printf(MSG1"\n", filename) > "/dev/stderr"
       continue
     }
-    match(fil, /\nExec=([^\n]+)/, m); exec=m[1]
-    if(!exec) continue # trap bogus .desktop files
+    if(! (match(fil, /\nType=Application/) && match(fil, /\nExec=([^\n]+)/, m) && exec=m[1]))
+      continue # trap bogus .desktop application files
     # Delete freedesktop.org %F parameter since Exec= value is going to sh.
     sub(/[ \t]*%[a-zA-Z][ \t]*$/, "", exec)
-    match(fil, /\nIcon=([^\n]*\/)?([^\n.]+)([.][^\n]*)?/, m)
+    match(fil, /\nIcon=([^\n]*\/)?([^\n/.]*)([.][^\n]*)?/, m)
     icnpath=m[1]; icnname=m[2]; icnext=substr(m[3],2)
     if(index(icnext, ".")) {
       # case "filename.any[.any ...].EXT"
@@ -620,7 +857,10 @@ END { # [[[2
       icnname = icnname "." substr(icnext, 1, length(icnext)-length(ic[nic])-1)
       icnext = ic[nic]
     }
-    if(icnext && ! match(icnext, /png|svg|xpm/)) {
+    # corner case /path/.DirIcon: make new distinguishable unique name
+    if(!icnname && icnext) {
+      icnname = UNIQUEPREFIX i # [[:digit:]]+
+    } else if(icnext && ! match(icnext, /png|svg|xpm/)) {
       # case "file.name" implicit icon EXT
       icnname = icnname "." icnext
       icnext = ""
@@ -635,31 +875,48 @@ END { # [[[2
         while(key[k = k"%<"]);
       }
       key[k] = k
-      if(ALL_ICONS == "true") icon_workaround(sh)
+      if(ALL_ICONS == "true") {
+        delete Ret
+        icon_wa_push_icnname(i, Ret)
+        icnpath = Ret["icnpath"]
+        icnname = Ret["icnname"]
+      }
       out[k] = format_item()
+    }
+  }
+  if(ALL_ICONS == "true" && ! ICON_WA_READY) {
+    if(icon_wa_find_icon_files()) {
+      icon_wa_match_and_link(sh)
+      icon_wa_bind(out)
     }
   }
   # Sort by name and print.
   nkey = asort(key) # Note: asort is a GNU awk (gawk) extension.
   for(i=1; i<=nkey; i++) {
-    print substr(out[key[i]], 1, 510)
-    # 510 works around gtkdialog tree widget buffer overflow limit
+    print substr(out[key[i]], 1, '$GTKDIALOG_MAX_BYTE_LEN_BUG')
   }
-  # Remember if we performed a complete icon work-around.
-  mark_icon_workaround_uptodate()
+  # Remember that we performed a complete icon work-around.
+  mark_icon_wa_is_uptodate()
   # Close shell.
   print "exit" | sh
   close(sh)
-  if('${DEBUG1:-0}') print "]] BUILDER" >"/dev/stderr"
+  close_progress_dialog(PROGRESS_PID)
+  if('${DEBUG1:-0}') {
+    (__c = "date +%s.%N") | getline __t1; close(__c)
+    printf "\033[7mELAPSED ms building .desktop application database %g\033[0m\n", (__t1-__t0)*1000 >"/dev/stderr"
+    print "]] .desktop app db BUILDER" >"/dev/stderr"
+  }
 }
 
 function format_item(   ic,cols) { # [[[2
 # Format tree widget item - columns: icon, name, all-packed-values.
 # Note: assert data does not include characters "|" and $SEP.
   ic = format_icon_cell()
-  # The second column, always empty, is reserved for future expansion.
+  # Column names per tree widget varLIST: Icon|Label|Reserved. The third column, is reserved for fuzzy search details.
   # The tree widget does display its value.
-  cols = sprintf("%s||%s|%s", \
+  # findnrun-formatter formats same as sprintf below.
+  if(index(comment, "&")) gsub(/&/, "_", comment) # & bothers awk regex replacements somewhere downstream.
+  cols = sprintf("%s|%s||%s", \
     ic, name, \
     sprintf("%s'${SEP}'%s'${SEP}'%s'${SEP}'%s'${SEP}'%s", \
     filename,name,exec,comment,category))
@@ -668,83 +925,191 @@ function format_item(   ic,cols) { # [[[2
 }
 
 function format_icon_cell( ) { # [[[2
-# Format tree row icon cell.
-# Use within <input icon-column="0"> or <stock-column="0">
+# Format gtkdialog tree widget icon cell content.
+# Cells are output to varLIST`s directive <input icon-column="0">.
 # Note: tree widget does not support icons with paths anyway.
-  return(icnpath ? icnpath icnname "." icnext : icnname)
+# FALLBACK_ICON is used as fallback icon-reference per usr/share/findnrun/doc/plugin-dev.md.
+  return(icnpath ? icnpath icnname "." icnext : (""!=icnname ? icnname : FALLBACK_ICON))
 }
 
-function icon_workaround(sh,    a,c,IFP,ifp,x,lnk,ext) { # [[[2
-# Workaround for gtkdialog tree widget not displaying icons with path.
-  # Supposedly, IFP is the icon full path (it is used as the icon index key).
-  IFP = icnpath icnname (icnext ?".":"") icnext
-  if("" == IFP) return
-  # If the work-around is not up-to-date run sh/find/ln to create icon links.
-  if(!ICONUPDATED) {
-    #printf "L" > "/dev/stderr"
-    ifp = IFP
-    c = ""
-    if(-1 == getline < ifp) { # file ifp does not exist
-      # This could happen because .desktop file sets Icon=name-only (valid), but
-      # we cannot trust gtkdialog to show icons by name without extension, so
-      # get the full pathname; ref. http://standards.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html#icon_lookup
-      # next 3 lines: expand colon-separated list to shell words
-      icon_dirs = "'"$ICON_DIRS"'"
-      gsub(/:/, "\" \"", icon_dirs)
-      icon_dirs = "\"" icon_dirs "\""
-      c = "2>/dev/null find -L " icon_dirs \
-        " -type f \\( -name \""icnname".png\" -o -name \""icnname".svg\" -o -name \""icnname".xpm\" \\) -print0 -quit"
-        # ! -path "*/.*/*" excludes all matches within any hidden dir, neat!
-        # -print0 ensures match string does not include \n character
-        # -quit exits after first match, if any; GNU awk (gawk) extension.
-      # Read found path into ifp, which stays == "" if nothing found.
-      ifp=""; c | getline ifp; close(c)
-      # Note that ifp is null-terminated. See \x00 below.
-    } else { # file ifp exists
-      close(ifp)
-    }
-    if("" != ifp) {
-      sub(/\x00/,"",ifp)
-    } else {
-      printf(MSG2"\n", filename, icnpath icnname ("" != icnext ? "."icnext : "")) >"/dev/stderr"
-      return
-    }
-    # try symlinking target ifp
-    x = split(ifp, a, /\//)
-    lnk = a[x] # link name lnk <- icon-name[.ext] (no path)
-    ext = (x = split(lnk, a, /\./)) ?"."a[x] :"" # ".ext" if any
-    if(ext) x-- # forget ext from split link name
-    # implode link name while replacing all dots with underscores
-    lnk = ""; for(c=1; c<=x; c++) lnk = lnk "_" a[c]; lnk = substr(lnk, 2)
-    # Symlink the icon.
-    print "2>/dev/null ln -s \""ifp"\" \"" ICONSTEM lnk ext "\"" | sh
-    # Progressively build the icon index file.
-    printf "%s\x00%s\x00%s\x00%s\n", IFP, ifp, lnk, ext >> (ICONSTEM".index")
-  } else {
-    #printf "I" > "/dev/stderr"
-    # The work-around is up-to-date so use ICONINDEX map to speed things up
+function icon_wa_push_icnname(i,byRef,   IFP,a) { # [[[2
+# Push caller`s data that icon_wa_find_icon_files and icon_wa_bind will use.
+# Return icnpath and icnname (resolved if possible otherwise as a slot to be bound subsequently).
+
+  # IFP is the icon full filepath, which is used as the ICONINDEX key.
+  WA[++nWA,"IFP"] = IFP = icnpath icnname (icnext ?".":"") icnext
+  WA[nWA,"desktop"] = filename
+  WA[nWA,"icnname"] = ""!=icnname ? icnname : FALLBACK_ICON
+
+  # Return icnname either resolved or as a slot to be bound subsequently.
+  # For gtkdialog to actually be able to display an icon, the icon name for the
+  # tree widget must not include dot+extension. However, when passing a symlink file
+  # name the extension must be included.
+  # Link names start with "$CACHEFILEPREFIX" to reflect that they are located in
+  # the cache directory via $ICONSTEM->.
+  if(ICON_WA_READY) { # see icon_wa_match_and_link for comments
     split(ICONINDEX[IFP], a, "\x00")
-    lnk = a[3]
+    byRef["icnname"] = "'"$CACHEFILEPREFIX"'"(""!=a[3] ? a[3] : FALLBACK_ICON) # file name w/o ext
+  } else {
+    # To enter this else-block: enable Show all icons; wait for search to
+    # complete; exit findnrun; rm the icon cache folder; restart findnrun to
+    # enter this else-block.  The next run following this restart will fall
+    # into the if-block above.
+    # "<id=...>" is a slot for icon_wa_bind to fill after the symlinks have been created.
+    byRef["icnname"] = "'"$CACHEFILEPREFIX"'<id="nWA">" # file name w/o ext
   }
 
-  icnpath = "" # this tells format_item() to use icnname only
-  icnname = "findnrun-" lnk # no ext
-  # gtkdialog is very finicky: icon name must not include dots nor extension
-  # but the link name must include an extension!
+  # Return icnpath:
+  byRef["icnpath"] = "" # this tells format_item() to use icnname only
 }
 
-function is_icon_workaround_uptodate(   uptodate,x) { # [[[2
-# Is the icon work-around enabled and up-to-date? - icon_workaround() helper.
+function icon_wa_init() { # [[[2
+  WA_ALL_ICON_PATHS = ""
+  delete WA
+  nWA = 0
+}
+
+function icon_wa_find_icon_files(   c,aifp,icon_dirs,icon_theme_name,p1,p2,e1,e2) { # [[[2
+  aifp = "'"$AIPF"'"
+  if(0 < (getline WA_ALL_ICON_PATHS < aifp)) {
+    close(aifp)
+    return(1)
+  }
+  icon_theme_name = "'"$GTK_ICON_THEME_NAME"'"
+  # Find paths (colon-separated)
+  icon_dirs = "'"$ICON_DIRS"'"
+  # Find expression that matches icon file names (find -D opt)
+  e1 = "-type f \\( -name \\*.xpm -o -name \\*.png -o -name \\*.svg -o -name .DirIcon \\) -print"
+  if("" == icon_theme_name) {
+    e2 = e1
+  } else {
+    p1 = "'"$HOME_ICONS_LEGACY"'/"icon_theme_name
+    p2 = "/usr/share/icons/"icon_theme_name
+    # Find user`s selected theme icons before any other icons
+    icon_dirs = p1":"p2":"icon_dirs
+    # visit p1 or p2 but ignore all other icon_theme_name directories
+    e2 = " -depth -path \""p1"/*\" " e1 \
+      " -o -depth -path \""p2"/*\" " e1 \
+      " -o -name \""icon_theme_name"\" -prune"
+    # visit other (non-ignored) directories
+    e2 = e2 " -o " e1
+  }
+  # split/quote paths
+  gsub(/:/, "\" \"", icon_dirs)
+  icon_dirs = "\"" icon_dirs "\""
+
+  c = "2>/dev/null find -L " icon_dirs " " e2
+  c | getline WA_ALL_ICON_PATHS; close(c)
+  if("" != WA_ALL_ICON_PATHS) {
+    printf WA_ALL_ICON_PATHS > aifp
+    close(aifp)
+    return(1)
+  }
+  return(0) # No system/user icons found (shouldn`t happen)
+}
+
+function icon_wa_match_and_link(sh,    i,IFP,ifp,icnname,c,x,a,lnk,ext,p) { # [[[2
+# Workaround for gtkdialog tree widget failing to display icons with path.
+  WA_ALL_ICON_PATHS = "\n" WA_ALL_ICON_PATHS "\n"
+  for(i = 1; i <= nWA; i++) {
+    # IFP is the icon full filepath, which is used as the ICONINDEX key.
+    IFP = WA[i,"IFP"]
+    if("" == IFP) { # defensive
+      WA[i,"bind"] = FALLBACK_ICON # for icon_wa_bind to bind
+      continue
+    }
+    # If the work-around data needs updating then create icon links, etc.
+    # Refresh the icon filepath. [[[3
+    ifp = IFP
+    if(-1 != getline < ifp) {
+      close(ifp) # icon file ifp exists
+    } else { # file ifp does not exist
+      # Find the full icon pathname from the icon name only, if any.
+      # cf. http://standards.freedesktop.org/icon-theme-spec/icon-theme-spec-latest.html#icon_lookup
+      icnname = WA[i,"icnname"]
+      if(1 == index(icnname, UNIQUEPREFIX)) { # corner case /path/.DirIcon
+        sub(UNIQUEPREFIX"[[:digit:]]+", "", ifp)
+        if(-1 != getline < ifp) {
+          close(ifp) # icon file x exists
+        } else {
+          ifp = ""
+        }
+      } else {
+        ifp = ""
+        # matched without regex for a huge speed increase
+        if(p = index(WA_ALL_ICON_PATHS, "/"icnname".")) { # potential match
+          # look back enough (-512) and look ahead enough (+6: +4 for
+          # /.(png|svg|xpm)/ and +2 for /\n./) to cross \n boundaries
+          x = substr(WA_ALL_ICON_PATHS, p -512, +512+length(icnname) +6)
+          x = split(x, a, /\n/)
+          if(index(a[x -1], "/"icnname".")) { # confirmed that it`s an actual match
+            ifp = a[x -1]
+          }
+        }
+      }
+    }
+    if("" == ifp) { # no icon resource can be found in the system.
+      printf MSG2"\n", WA[i,"desktop"], WA[i,"IFP"]  >"/dev/stderr"
+      WA[i,"bind"] = FALLBACK_ICON # for icon_wa_bind to bind
+      continue
+    }
+
+    # Symlink the target ifp. [[[3
+    # Note that link file creation may be postponed until END performs close(sh).
+    # The link name is located in the icon cache directory ICONSTEM->.
+    # The icon name passed to the tree widget must not include dot+extension.
+    # However, when passed a link name, GTK seems to require a supported extension png|svg|xpm.
+    x = split(ifp, a, /\//)
+    lnk = a[x] # link name lnk <- icon-name[.ext] (no path)
+    ext = (x = split(lnk, a, /\./)) > 1 ?"."a[x] :"" # ".ext" if any
+    if(ext) x-- # exclude ext from split link name
+    if(!a[1]) { # corner case /path/.DirIcon
+      # borrow from IFP: refill a[] for imploding link name
+      x = split(IFP, a, /\//)
+      c = a[x]
+      c = (x = split(c, a, /\./)) > 1
+      if(c) x--
+      ext = ".png" # fake the extension to please GTK
+    }
+    # implode link name while replacing all dots and dashes with underscores
+    # (no dashes to avoid the risk of clash with GTK`s icon sub-theme name rules)
+    lnk = ""; for(c=1; c<=x; c++) {
+      gsub(/-/, "_", a[c])
+      lnk = lnk "_" a[c]
+      lnk = substr(lnk, 2)
+    }
+    print "2>/dev/null ln -s \""ifp"\" \"" ICONSTEM lnk ext "\"" | sh
+
+    # Store values for icon_wa_bind to bind. [[[3
+    WA[i,"bind"] = lnk # link name for "$CACHEFILEPREFIX"lnk
+
+    # Progressively build the icon index file. [[[3
+    printf "%s\x00%s\x00%s\x00%s\n", IFP, ifp, lnk, ext >> (ICONSTEM".index")
+  }
+}
+
+function icon_wa_bind(byRef,   k,M) { # [[[2
+  # Bind all slots "<id="nWA">".
+  for(k in byRef) {
+    if(match(byRef[k], /<id=([[:digit:]]+)>/, M)) {
+      byRef[k] = substr(byRef[k], 1, RSTART -1) WA[M[1],"bind"] substr(byRef[k], RSTART + RLENGTH)
+    }
+  }
+}
+
+function is_icon_wa_uptodate(   uptodate,x) { # [[[2
+# Is the icon work-around requested and are its data up-to-date?
   if(uptodate = ("true" == ALL_ICONS)) {
+    # test for file existence
     if(uptodate = (-1 != (getline < (x = ICONSTEM".uptodate"))))
       close(x)
   }
-  if('${DEBUG2:-0}') print "is_icon_workaround_uptodate="uptodate > "/dev/stderr"
+  if('${DEBUG2:-0}') print "is_icon_wa_uptodate="uptodate > "/dev/stderr"
   return(uptodate)
 }
 
 function read_icon_index(   a,b,data,i,x) { # [[[2
-# Read the index file - icon_workaround() helper
+# Read the index file located in the icon work-around data directory.
   if('${DEBUG2:-0}') print "in read_icon_index" >"/dev/stderr"
   if(1 == (getline data < (x = ICONSTEM".index"))) {
     close(x)
@@ -756,11 +1121,11 @@ function read_icon_index(   a,b,data,i,x) { # [[[2
   }
 }
 
-function mark_icon_workaround_uptodate( ) { # [[[2
-# If the icon work-around is enabled, mark whether it is up-to-date.
+function mark_icon_wa_is_uptodate( ) { # [[[2
+# If the icon work-around is enabled, mark whether its date are up-to-date.
   if("true" == ALL_ICONS) {
     print "" > (ICONSTEM".uptodate")
-    if('${DEBUG3:-0}') print "\nmark_icon_workaround_uptodate() created", ICONSTEM".uptodate" > "/dev/stderr"
+    if('${DEBUG3:-0}') print "\nmark_icon_wa_is_uptodate() created", ICONSTEM".uptodate" > "/dev/stderr"
   }
 }
 
@@ -784,178 +1149,560 @@ function read_list_file(list_file, acontent,   name,nname,nfiles,f,i,s) { # [[[2
   return(0+nfiles)
 }
 
-'
+function show_progress_dialog(message,   pid,c,p,s,A,px,py,w,h,g,cmd) { # [[[2
+  # Center the dialog over the main window.
+  c="xwininfo -name \"'"${APP_TITLE_UNIQ:-$APP_TITLE}"'\" 2>/dev/null"
+  c | getline s # slurp wininfo output
+  close(c)
+  if('${DEBUG2:-0}') print "XWININFO("c")[[\n"s"\n]] XWININFO" >"/dev/stderr"
+  ## Make pattern
+  p =   "Absolute upper-left X:[[:space:]]+(-?[[:digit:]]+)" ".*"
+  p = p "Absolute upper-left Y:[[:space:]]+(-?[[:digit:]]+)" ".*"
+  p = p "Relative upper-left X:[[:space:]]+(-?[[:digit:]]+)" ".*"
+  p = p "Relative upper-left Y:[[:space:]]+(-?[[:digit:]]+)" ".*"
+  p = p "Width:[[:space:]]+([[:digit:]]+)" ".*"
+  p = p "Height:[[:space:]]+([[:digit:]]+)"
+  if(!match(s, p, A))
+    { return("") }
+  ## Calculate new size and position.
+  px = A[1] - A[3] + 1; py = A[2] - A[4]; w = A[5] - 1; h = A[6]
+  if('${DEBUG2:-0}') printf "px(%d) py(%d) w(%d) h(%d)\n", px,py,w,h >"/dev/stderr"
+  py = h / 2 + py; h = 0 # unconstrained height
+  if(px < 0) { w += px; px = 0 }
+  if(py < 0) { py = 0 }
+  if('${DEBUG2:-0}') printf "px(%d) py(%d) w(%d) h(%d)\n", px,py,w,h >"/dev/stderr"
+  ### Display progress dialog.
+  cmd = " --progress-text=\""message"\" --progress --pulsate --splash --no-buttons < /dev/null & echo $! >\"'"${YPID}"'\""
+  g = sprintf("--geometry %dx%d+%d+%d --width=%d --height=%d", w, h, px, py, w, h)
+  if('${DEBUG2:-0}') print "geometry("g")" >"/dev/stderr"
+  if(system("yad "g cmd))
+      { return("") }
+  getline pid < "'"${YPID}"'" # running yads PID
+  close("'"${YPID}"'")
+  if('${DEBUG2:-0}') print message" PROGRESS_PID="pid >"/dev/stderr"
+  return(pid)
+}
 
-# Prepare the database query script. [[[1
+function close_progress_dialog(pid,   killer) { # [[[2
+  if(PROGRESS_PID) { # close the progress gauge
+    killer = "/bin/kill "PROGRESS_PID
+    print "" | killer
+    close(killer)
+  }
+}
+
+#gawk]]]' # [[[2]]]
+
+# Prepare the database query script a.k.a. search engine. [[[1
 # Usage: gawk -f "${AWKQ}" [-v GREP="string"] ${DATF}
-unset case subject commleft left categ REDIRECT2 func statements
-[ true = "${CASEDEPENDENT}" ] || case=tolower
-if ! [ true = "${SEARCHCOMPLETE}" ]; then
-  # Split out the last field of the record that $AWK's format_item() printed.
-  statements="
-  split(\$(NF), a, /${SEP}/) # a <- {fullpathname,name,exec,comment,category}"
-  if [ true = "$SEARCHFILENAMES" ]; then
-    statements="$statements
-    gsub(/^.*[/]|[.][^.]+$/, \"\", a[1]) # basename(fullpathname, .ext)"
-  fi
-  subject="${case}(a[2])"
-else
-  # Keep basename(fullpathname, .ext) & sub-fields 'name'..'category'.
-  statements="
-  a=\$(NF); x=index(a,\"${SEP}\"); a1=substr(a,1,x-1)
-  gsub(/^.*[/]|[.][^.]+$/, \"\", a1); a=a1 substr(a,x)"
-  subject="${case}(a)" # ="${case}(basename(a[1], .ext)\";\"a[2]\";\"a[3]\";\"a[4]\";\"a[5])"
-fi
-if [ true = "${SEARCHREGEX}" ]; then
-  REDIRECT2=" 2>/dev/null" # Quiet awk's "fatal: invalid regex" message
+write_query_script() # $1-target ::= "fzf"|"v1-fuzzy"|"v1-exact"
+{
+  local target=$1
+# Output script structure: [[[
+# If $target == fzf
+# Then use fzf search engine for both fuzzy and exact matching (regex not possible)
+#   Match(fzf_nth(appname, ?comment, ?categories, ?filename))
+#   where fzf_nth is fzf option --nth, which matches selectively sub-fields.
+#   Sub-fields are enabled DYNAMICALLY according to the values of
+#   $SEARCHCOMMENTS, $SEARCHCATEGORIES, $SEARCHFILENAMES.
+#   Ignored: $SEARCHFROMLEFT.
+# Else If $target == v1-fuzzy
+# Then Match(concat(appname, ?filename, ?comment, ?categories))
+#   (concat DYNAMICALLY, so this is equivalent to fzf but limited to the fuzzy case)
+#   Ignored: $SEARCHFROMLEFT.
+# Else Match(appname) || MatchX(filename) || MatchX(comment) || MatchX(categories)
+#   where function MatchX is STATICALLY included iff X = true for
+#   X in {$SEARCHFILENAMES, $SEARCHCOMMENTS, $SEARCHCATEGORIES}
+#   The Match function and its argument are statically prepared according to the values of
+#   $SEARCHREGEX and $SEARCHFROMLEFT.
+# When a match occurs:
+# If $target == fzf
+# Then gawk END statement prints all matched records, including nth fields.
+# Else If $target = v1-fuzzy
+# Then gawk function fuzzy_out() in END statement prints all matched strings including concat
+# Else gawk main loop prints each matched string immediately.
+# ]]]
+local subject fnameleft commleft left categ REDIRECT2 func extract_data_fields begin_body body end_body
+# Sanity check: fall back to built-in target if fzf isn't installed.
+[ fzf = "$target" ] && ! [ "$FNRFZF" ] && target=v1-fuzzy # fallback
+# Variables that describe the match expression. [[[2
+if [ fzf = "$target" ]; then
+  : blank
+elif [ v1-fuzzy = "$target" ]; then
+  func=fuzzy_match_record
+elif [ true = "${SEARCHREGEX}" ]; then
   func=match
+  REDIRECT2=" 2>/dev/null" # Quiet awk's "fatal: invalid regex" message
   [ true = "${SEARCHFROMLEFT}" ] && left="&& RSTART==1"
-else
+else # SEARCHDEFAULT
   func=index
   [ true = "${SEARCHFROMLEFT}" ] && left="==1"
 fi
-subject="${func}(${subject},GREP)"
-if ! [ true = "${SEARCHCOMPLETE}" ]; then
-  [ true = "${SEARCHFILENAMES}" ] && fnameleft="|| ${func}(${case}(a[1]),GREP)${left}"
-  [ true = "${SEARCHCOMMENTS}" ] && commleft="|| ${func}(${case}(a[4]),GREP)${left}"
-  case $SEARCHCATEGORIES in true|hidden) categ="|| ${func}(${case}(a[5]),GREP)";; esac
+# Extract the last field of the last record printed by $AWKB::format_item().
+extract_data_fields="delete a
+  nA = split(\$(NF), a, /${SEP}/) # a[1..5] <- {fullpathname,appname,exec,comment,category}
+  a[2] = \$(nA > 1 ? 2 : 0)" # While both a[2] and $2 hold the appname, taps like FNRsc omit a[2]'s value,
+  # so we set a[2] = $2 to be sure. Specifically taps filtered through "findnrun-formatter -O s" set a[2] null.
+  # When nA is < 2 we set a[2] = $0 the entire record. This can happen when a plugin calls FNRsearch().
+if [ true = "$SEARCHFILENAMES" ]; then
+  extract_data_fields="$extract_data_fields"'
+  sub(/^.*\//, "", a[1]) # basename
+  if(index(a[1], ".") > 1) {sub(/\.[^.]+$/, "", a[1])} # w/o ext'
 fi
-> "${AWKQ}" echo '#!/usr/bin/gawk -f
-BEGIN {
-  if('${DEBUG3:-0}') {
-    print "\n=== DB QUERY [[ GREP=\""GREP"\"" >"/dev/stderr"
-    print "expression=('"${subject}${left} ${fnameleft} ${commleft} ${categ}"')" >"/dev/stderr"
-  }
-  FS="|"
+if [ v1-fuzzy = "$target" ]; then
+  searchfilenames="\"$SEP\"" searchcomments="\"$SEP\"" searchcategories="\"$SEP\""
+  unset field_mask
+  [ true = "$SEARCHFILENAMES" ] && searchfilenames="${searchfilenames}a[1]" field_mask=1
+  [ true = "$SEARCHCOMMENTS" ] && searchcomments="${searchcomments}a[4]" field_mask=$((field_mask + 2))
+  [ true = "$SEARCHCATEGORIES" ] && searchcategories="${searchcategories}a[5]" field_mask=$((field_mask + 4))
+  extract_data_fields="$extract_data_fields
+  a[0] = a[2]${field_mask:+${searchfilenames}${searchcomments}${searchcategories}} # a[0..5]
+  FIELD_MASK=${field_mask:-0}"
+else
+  extract_data_fields="$extract_data_fields"
+fi
+if [ v1-fuzzy = "$target" ]; then
+  # Search in a[0] (appname "\b" ?filename "\b" ?comment "\b" ?category).
+  subject="${func}(a[0],GREP)"
+else
+  # Search in a[2] (appname) or in ?a[1](filename) or in ?a[4](comment) or in ?a[5](category).
+  subject="${func}(@CASE(a[2]),GREP)"
+  [ true = "${SEARCHFILENAMES}" ] && fnameleft="|| ${func}(@CASE(a[1]),GREP)${left}"
+  [ true = "${SEARCHCOMMENTS}" ] && commleft="|| ${func}(@CASE(a[4]),GREP)${left}"
+  case $SEARCHCATEGORIES in true|hidden) categ="|| ${func}(@CASE(a[5]),GREP)";; esac
+fi
+if [ fzf = "$target" ]; then
+  query="fzfcop"
+else
+  query="GREP && (${subject}${left} ${fnameleft} ${commleft} ${categ}) || !GREP"
+fi
+# Variables that describe what happens on a match. [[[2
+local print_max_len="print substr(\$0, 1, $GTKDIALOG_MAX_BYTE_LEN_BUG)"
+local debug_get_top_row='if(!DEBUG_TOP_ROW){DEBUG_TOP_ROW=$0}'
+if [ v1-fuzzy = "$target" ]; then
+  body="if(!GREP){$print_max_len${DEBUG1:+; $debug_get_top_row}}" # optization to speed up start up
+  end_body='fuzzy_out()' # fuzzy_out sets DEBUG_TOP_ROW
+elif [ fzf = "$target" ]; then # [[[
+  begin_body='
+is_fuzzy = "true" == ENVIRON["SEARCHFUZZY"] ? 1:0
+is_comment = "true" == ENVIRON["SEARCHCOMMENTS"] ? 1:0
+is_category = "true" == ENVIRON["SEARCHCATEGORIES"] ? 1:0
+is_filename = "true" == ENVIRON["SEARCHFILENAMES"] ? 1:0
+is_casesensitive = "true" == ENVIRON["CASEDEPENDENT"] ? 1:0
+fzfopt = "-d \"'$SEP'\" --nth 3"(is_comment ? ",5":"")(is_category ? ",6":"")(is_filename ? ",2":"")(!is_fuzzy ? " -e":"")(is_casesensitive ? " +i":"")
+fzfcop = "\"'"$FNRFZF"'\" -f \""GREP"\" "fzfopt
+'"${DEBUG1:+print fzfcop > \"/dev/stderr\"}"'
+'
+  extract_data_fields='
+nA = split($NF, a, /'$SEP'/) # a[1..5] <- {fullpathname,appname,exec,comment,category}
+a[2] = $(nA > 1 ? 2 : 0) # Note
+sub(/^.*\//, "", a[1]) # basename
+if(index(a[1], ".") > 1) {sub(/\.[^.]+$/, "", a[1])} # w/o ext
+' # Note: While both a[2] and $2 hold the appname, taps like FNRsc omit a[2]'s value,
+  # so we set a[2] = $2 to be sure. Specifically taps filtered through "findnrun-formatter -O s" set a[2] null.
+  # When nA is < 2 we set a[2] = $0 the entire record. This can happen when a plugin calls FNRsearch().
+
+  # optization to speed up start up
+  body="
+if(!GREP) { # optimization to speed up start up
+  $print_max_len${DEBUG1:+; $debug_get_top_row}"'
+} else {
+  # here and fzfopt: 1(NR) 2(fileNAME) 3(appname) 4(exec) 5(comment) 6(categories)
+  OFS = "'$SEP'"
+  print NR, a[1], a[2], a[3], a[4], a[5] |& fzfcop
+  InputRecord[NR] = $0
 }
-{'"${statements}"'
-  # narrow matches by GREP pattern
-  if(GREP && ('"${subject}${left} ${fnameleft} ${commleft} ${categ}"') || !GREP) {
-    print substr($0, 1, 510)
-    # 510 works around gtkdialog tree widget buffer overflow limit
+'
+  end_body='
+if(GREP) {
+  close(fzfcop, "to")
+  '"${DEBUG1:+DEBUG_TOP_ROW = \"\"}"'
+  OFS = "|"
+  while(0 < (fzfcop |& getline)) {
+    split($0, a, "'$SEP'")
+    $0 = InputRecord[a[1]]
+    #if(is_fuzzy) { # column 3 cosmetics
+      col3 = (is_comment && a[5] ? "`"a[5]:"") (is_category && a[6] && ";" != a[6] ? "`"a[6]:"") (is_filename && a[2] ? "`"a[2]:"")
+      if(col3) { $3 = col3 }
+    #}
+    print substr($0, 1, '$GTKDIALOG_MAX_BYTE_LEN_BUG')
+  }
+  close(fzfcop, "from")
+  '"$debug_get_top_row"'
+}'
+else
+  body="$print_max_len${DEBUG1:+; $debug_get_top_row}"
+fi # ]]]
+
+# Compose an awk script from the above shell variables. [[[2]]]
+> "${AWKQ}" printf %s\\n '#[[[gawk
+BEGIN {
+  CASE = "true" == ENVIRON["CASEDEPENDENT"] ? "identity" : "tolower"
+  '${DEBUG1:+ ' searchexpr="'"${subject}${left} ${fnameleft} ${commleft} ${categ}"'"'}'
+  '${DEBUG1:+ ' gsub("@CASE", CASE, searchexpr)'}'
+  '${DEBUG1:+ ' gsub("a\\[1\\]", ".desktopFile", searchexpr)'}'
+  '${DEBUG1:+ ' gsub("a\\[2\\]", "AppName", searchexpr)'}'
+  '${DEBUG1:+ ' gsub("a\\[4\\]", "Comment", searchexpr)'}'
+  '${DEBUG1:+ ' gsub("a\\[5\\]", "Category", searchexpr)'}'
+  '${DEBUG1:+ ' gsub("GREP", "\""GREP"\"", searchexpr)'}'
+  '${DEBUG1:+ ' print "\n=== DB QUERY [[ " searchexpr > "/dev/stderr"'}'
+
+  SEP="'${SEP}'"
+  FS="|"
+  '"${begin_body}"'
+}
+{
+  # extract searched-in fields
+  '"${extract_data_fields}"'
+  # match typed pattern GREP
+  if('"${query}"') {
+    '"${body}"'
   }
 }
 END {
-  if('${DEBUG3:-0}') print "]] QUERY" >"/dev/stderr"
-} '
-
-# Build database of .desktop file entries. [[[1
-LIST_FILE="${AWKB}.list-file"
-ifs=$IFS; IFS=:; set -- $DESKTOP_FILE_DIRS
-# Recursive search supports common wine games.
-find -L "$@" -type f -name '*.desktop' > "$LIST_FILE" 2>/dev/null
-IFS=$ifs
-gawk -v ALL_ICONS=${varICONS} -v SHOWNODISPLAY=${SHOWNODISPLAY} -f "${AWKB}" -v LIST_FILE="$LIST_FILE" > "${DATF}"
-[ "${DEBUG1}" ] && { >/tmp/varSEARCH; echo >&2 === READING SEARCH INPUT ALSO FROM /tmp/varSEARCH; }
-NDATF=$(wc -l "${DATF}"); NDATF=${NDATF%% *}
-
-# Prepare Help system and its GUI button (About). [[[1
-# i18n About dialog.
-find_help() #[[[
-{
-  # In:  ${FNRHELPINDEX} paths.
-  # Out: ${helpviewer} command, ${helpbutton} gtk code.
-  local IFS=:
-  set ${FNRHELPINDEX}
-  for i; do
-    unset x p s helpviewer helpbutton; hf="$i"
-    case "${hf}" in *\[*\]*) p="${hf%[*}["; s="]${hf##*]}" # search for translation
-      [ -e "$p${LL}$s" ] && hf="$p${LL}$s"; [ -e "$p${LR}$s" ] && hf="$p${LR}$s"; [ -e "$p${LANG}$s" ] && hf="$p${LANG}$s" ;;
-    esac
-    if [ -e "${hf}" ]; then
-      hd="${TMPD}/help" && mkdir -p "${hd}" &&
-      case "${hf##*.}" in t[gx]z|[gx]z) tar -C "${hd}" -xaf "${hf}" && hf=$(set +f; echo "${hd}"/index.*) ;; esac &&
-      case "${hf##*.}" in md) x=${FNRMDVIEW:-mdview} ;; htm*) x=defaultbrowser;; esac
-      read -t 1 helpviewer << EOF
-$(which $x www-browser x-www-browser defaulttexteditor geany leafpad 2>&-)
-EOF
-      case ${helpviewer} in
-        '') helpviewer="${BROWSER:-xdg-open} '${hf}'";; # catchall
-        *mdview) helpviewer='v() { for a; do [ -e "$a" ] && cd "${a%/*}" && exec "'"$helpviewer"'" "${a%/*}" "${a##*/}" "'"$APP_TITLE"'" & sleep 0.4 || sleep 1; done ;}; v "'"$hf"'"' ;;
-        *browser) helpviewer="'${helpviewer}' 'file://${hf}'" ;;
-        *) # dup help files to protect sources from text editors
-          if ! [ "${hf%/*}" = "${hd}" ]; then cp -fr "${hf%/*}/"* "${hd}/"; fi &&
-          helpviewer="cd '${hd}' && '${helpviewer}' 'no-help.md'" ;;#${hf##*.}'";;
-      esac &&
-      helpbutton="
-<button use-underline=\"true\">
-  <label>$(gettext "_Help")</label>
-  <input file stock=\"gtk-help\"></input>
-  <action>${helpviewer} &</action>
-  <action>closewindow:GUI_ABOUT</action>
-</button>"
-    break # on first valid help file path $hf found
-  fi
-  done
+  '"${end_body}"'
+  '${DEBUG1:+' # debug: show the top row unpacked'}'
+  '${DEBUG1:+' _nR=split(DEBUG_TOP_ROW,_R,"["FS SEP"]");for(_i=1;_i<=_nR;_i++)printf"% 4d : %s\n",_i,_R[_i]>"/dev/stderr";'}'
+  '${DEBUG1:+' if(_R[4]){while(0<(getline _s<_R[4])){print "  ",_s>"/dev/stderr"};close(_R[4])}'}'
+  '${DEBUG1:+' print "]] QUERY" >"/dev/stderr"'}'
 }
-#]]]
-find_help
+function identity(x) { return x }
+#gawk]]]' # [[[2]]]
+if [ v1-fuzzy = "$target" ]; then
+  >> "${AWKQ}" printf %s\\n '#[[[gawk
+BEGIN {
+  # Field bonus = %(abs(field score)) added to each field contribution
+  split("'"${FUZZY_MATCH_FIELD_BONUS:-0.3 0 0 0.5}"'", FieldBonus, " ")
+  FieldBonus[0] = 0 # reserved
+  # 0:call-penalty, 1:appname, 2:filename, 3:comment, 4:categories
+}
+function fuzzy_out(   n, i, p, q, rn, s, sa, sz, appname, rt, F, nF, ByScore) { # [[[2
+  # With global scalars gMark and FIELD_MASK, and global arrays
+  # InputRecord, RecordNumber and Formatted by fuzzy_match_record:
+  if(n = asorti(RecordNumber, ByScore, "@ind_num_desc")) {
+    for(i = 1; i <= n; i++) {
+      rn = RecordNumber[ByScore[i]]
+      r = InputRecord[rn]
+      if(rn in Formatted) {
+        if(FIELD_MASK) { # Formatted from a[0]
+          # Splice Formatted over list widget columns 2(Label) and 3(Reserved).
+          # Reserved takes fuzzy search matches for fields other than appname.
+          rt = "\342\200\246" # printf "\u2026" | od -b; unicode horizontal ellipsis
+          # appname could include some match marks or all marks could lie right of appname
+          s = Formatted[rn]
+          p = index(s, SEP)
+          appname = substr(s, 1, p - 1)
+          if(index(sz = substr(s, p + 1), gMark)) { # some marks lie right
+            sa = substr(sz, 1, q = index(sz, gMark) -1) # string right of appname but sans marks
+            nF = split(sa, F, "[; "SEP"]") # string to words
+            sz = F[nF] substr(sz, q + 1) # one word of left context before the first mark
+            gsub(SEP, " `", sz)
+            appname = appname FS rt "`" sz
+#printf "%16s %s%s%s\n", "", sa, appname, gensub(SEP, "@", "g", sz) >"/dev/stderr"
+          } else {
+            appname = appname FS # leave column 3 empty
+          }
+        } else { # Formatted from a[2]
+          appname = Formatted[rn] FS # leave column 3 empty
+        }
+        # Now splice appname over the two columns.
+        fs = FS == "|" ? "\\|" : FS
+        #           Icon|         Label|Reserved|    => Icon| AppName|Details|
+        r = gensub("([^"fs"]*"fs")([^"fs"]*"fs"){2,2}", "\\1" appname FS, 1, r)
+      } else appname = "NA";
+#printf "%+10.4f @ %s @ %s\n", ByScore[i], appname, substr(InputRecord[rn], 1, 80) > "/dev/stderr"
+      print substr(r, 1, '$GTKDIALOG_MAX_BYTE_LEN_BUG'-36) # {APPROX_SAFE_SIDE: room for 12*3-byte unicode gMark`s}
+    }
+    DEBUG_TOP_ROW = InputRecord[ RecordNumber[ByScore[1]] ]
+  }
+}
+function fuzzy_match_record(str, pattern,   byVal, requestFormattedStr, matched, score, sort_key) { # [[[2
+  # Sets global scalar gMark.
+  requestFormattedStr = 1
+  matched = fuzzy_match(pattern, str, byVal, requestFormattedStr)
+  if(matched) {
+    InputRecord[NR] = $0
+    score = byVal[2]
+    if(requestFormattedStr) {
+        Formatted[NR] = byVal[3]
+        gMark = byVal[4] # invariant
 
-# i18n About dialog widgets: window text; number of apps text (singular/plural)
-export GUI_ABOUT='
-<window title="'"${APP_TITLE}"'" icon-name="edit-find" window-position="2">
-  <vbox>
-    <frame>
-      <text justify="0" selectable="true" can-focus="false">
-        <label>"'"$(printf "$(gettext "%s %s
-authors: %s
-Open source - GNU GPL license applies
+      # With global FIELD_MASK add field bonus.
+      if(FIELD_MASK) {
+        '${DEBUG1:+' if(!start_) print start_="=================">"/dev/stderr";'}'
+        score += field_score_bonus(str, pattern, score)
+      }
+    }
 
-%s
-%s
+    sort_key = 0+(score"."sprintf("%04d", NR))
+    RecordNumber[sort_key] = NR
+  }
+  return matched
+}
+function field_score_bonus(str, pattern, score,   show, sort, n, i, delta, x_, mask) { # [[[2
+  # With global arrays FieldScore by fuzzy_match and FieldBonus by BEGIN:
+  # Return total bonus - optionally displaying field scores and bonus contributions.
 
-configuration: %s
-")" "${APP_NAME}" "${Version}" "step, SFR, L18L" \
-"http://www.murga-linux.com/puppy/viewtopic.php?t=98330" \
-"https://github.com/step-/find-n-run" "${CONFIG}")
-$(n="${NDATF}"; printf "$(ngettext "%s application found" "%s applications found" "$n")" "$n")
-$(n="${NSOURCES}"; printf "$(ngettext "%s source loaded" "%s sources loaded" "$n")" "$n"
-)"'"</label>
-      </text>
-    </frame>
-    <hbox homogeneous="true">
-      <text space-fill="true" space-expand="true"><label>""</label></text>
-      <button use-underline="true">
-        <label>'"$(gettext "_OK")"'</label>
-        <input file stock="gtk-ok"></input>
-        <action>closewindow:GUI_ABOUT</action>
-      </button>
-      '"${helpbutton}"'
-      <text space-fill="true" space-expand="true"><label>""</label></text>
-    </hbox>
-  </vbox>
-  <variable>GUI_ABOUT</variable>
-  <action signal="key-press-event" condition="command_is_true([ $KEY_SYM = Escape ] && echo true )">closewindow:GUI_ABOUT</action>
-</window>'
+  n = length(FieldScore);
+  # Show field scores before bonus.
+  show = '${DEBUG1:-0}' && (19==NR||82==NR||str~/compton|GIF/)
+  if(show) {
+    sort = "sort -k 10,9g |column -t -o \"|\" -s \"\t\" >&2"; # -k 2,9g
+    printf "|% 4d A", NR | sort;
+    for(i = 0; i < n; i++) {
+      printf "\t%+ 5d", FieldScore[i] | sort;
+    }
+    printf "\t=%+ 6d\t%s {%s}\n", score, gensub(SEP, "`", "g", Formatted[NR]), pattern | sort;
+    printf "|% 4d B", NR | sort;
+  }
 
-# Prepare the save filter script. [[[1
-# Usage: gawk -f "$AWK4" "\${file}" with $CUT and $RDR environment variables
-> "${AWK4}" echo '#!/usr/bin/gawk -f
+  # With global FIELD_MASK: compute field bonus:
+  # If field_i is enabled add abs(FieldBonus_i * FieldScore_i) to field score else zero out field score.
+  mask = or(lshift(FIELD_MASK, 2), 2, 1) # enabled fields, i={0,1} always
+  for(i = 0; i < n; i++) {
+    if(show) printf "\t%+ 5d", FieldScore[i] | sort;
+      FieldScore[i] += x_ = and(mask, lshift(1, i)) ? int(0.5 + FieldBonus[i] * ((x_ = FieldScore[i]) < 0 ? -x_ : x_)) : -FieldScore[i];
+    if(show) printf "%+d", x_ | sort;
+    delta += x_;
+  }
+  if(show) printf "\t=%+ 6d\t%s {%s}\n", score + delta, gensub(SEP, "`", "g", Formatted[NR]), pattern | sort;
+  return score
+}
+function max(a, b) { # [[[2
+    return a > b ? a : b;
+}
+# License for fuzzy_match [[[2
+# Functions fuzzy_match is derived work from prior art {1}. It is distributed
+# under the findnrun license, which is stated near the top of this file.
+# {1} https://github.com/forrestthewoods/lib_fts/blob/master/code/fts_fuzzy_match.js
+# {2} https://blog.forrestthewoods.com/reverse-engineering-sublime-text-s-fuzzy-match-4cffeed33fdb
+# The original prior-art license follows:
+
+#/ LICENSE
+#/
+#/   This software is dual-licensed to the public domain and under the following
+#/   license: you are granted a perpetual, irrevocable license to copy, modify,
+#/   publish, and distribute this file as you see fit.
+#/
+#/ VERSION
+#/   0.1.0  (2016-03-28)  Initial release
+#/
+#/ AUTHOR
+#/   Forrest Smith
+#/
+
+function fuzzy_match(pattern, str, byVal, requestFormattedStr,   adjacency_bonus, separator_bonus, camel_bonus, leading_letter_penalty, max_leading_letter_penalty, unmatched_letter_penalty, score, patternIdx, patternLength, prevMatched, prevLower, prevSeparator, bestLetter, bestLower, bestLetterIdx, bestLetterScore, matchedIndices, patternChar, strChar, patternLower, strLower, strUpper, nextMatch, rematch, advanced, patternRepeat, newScore, penalty, formattedStr, lastIdx, i, idx, matched,      null, field_separator, word_separators, call_counter_penalty, nMatchedIndices, fieldIdx, strAhead) { #[[[2
+#/ Returns bool matched & list byVal={matched, score, formattedStr}
+#/ bool: true if each character in pattern is found sequentially within str
+#/ score: integer; higher is better match. Value has no intrinsic meaning. Range varies with pattern.
+#/        Can only compare scores with same search pattern.
+#/ formattedStr: input str with matched characters marked in <b> tags. Delete if unwanted.
+#  Sets global array FieldScore[0..maxindex] with
+#    score == sum(FieldScore[1..maxindex]) + (FieldScore[0] = reserved = 0)
+#  Input str concatenates fields separated by field_separator
+
+    delete byVal;
+    delete FieldScore
+    null = "";
+    field_separator = SEP;
+    word_separators = "_ ;" field_separator;
+    fieldIdx = 1;
+
+    #/ Score consts
+    call_counter_penalty = -5;          #  penalty for each call after the first one
+    adjacency_bonus = 5;                #/ bonus for adjacent matches
+    separator_bonus = 10;               #/ bonus if match occurs after a separator        #+ and the next letter isn`t a word separator
+    camel_bonus =   0; #was: 10         #/ bonus if match is uppercase and prev is lower
+    leading_letter_penalty = -3;        #/ penalty applied for every letter in str before the first match
+    max_leading_letter_penalty = -9;    #/ maximum penalty for leading letters
+    unmatched_letter_penalty = -1;      #/ penalty for every letter that doesn`t matter
+
+    #/ Loop variables
+    score = 0;
+    patternIdx = 1;
+    patternLength = length(pattern);
+    strIdx = 1;
+    strLength = length(str);
+    prevMatched = 0;
+    prevLower = 0;
+    prevSeparator = 1;       #/ true so first letter match gets separator bonus
+
+    #/ Use "best" matched letter if multiple string letters match the pattern
+    bestLetter = bestLower = bestLetterIdx = null;
+    bestLetterScore = 0;
+
+    ## var matchedIndices = [];
+
+    #/ Loop over strings
+    strAhead = substr(str, strIdx, 1) # null at end of string
+    while (strIdx <= strLength) {
+        patternChar = patternIdx <= patternLength ? substr(pattern, patternIdx, 1) : null;
+        ##strChar = substr(str, strIdx, 1);
+        strChar = strAhead
+        strAhead = substr(str, strIdx + 1, 1); # null at end of string
+
+        #+ Entering new field
+        if(strChar == field_separator)
+            FieldScore[fieldIdx++] = score;
+
+        patternLower = patternChar != null ? tolower(patternChar) : null;
+        strLower = tolower(strChar);
+        strUpper = toupper(strChar);
+
+        nextMatch = patternChar != null && patternLower == strLower;
+        rematch = bestLetter != null && bestLower == strLower;
+
+        advanced = nextMatch && bestLetter != null;
+        patternRepeat = bestLetter != null && patternChar != null && bestLower == patternLower;
+        if (advanced || patternRepeat) {
+            score += bestLetterScore;
+            matchedIndices[++nMatchedIndices] = bestLetterIdx;
+            bestLetter = bestLower = bestLetterIdx = null;
+            bestLetterScore = 0;
+        }
+
+        if (nextMatch || rematch) {
+            newScore = 0;
+
+            #/ Apply penalty for each letter before the first pattern match
+            #/ Note: std::max because penalties are negative values. So max is smallest penalty.
+            if (patternIdx == 1) {
+                penalty = max((strIdx - 1) * leading_letter_penalty, max_leading_letter_penalty);
+                score += penalty;
+            }
+
+            #/ Apply bonus for consecutive matches
+            if (prevMatched)
+                newScore += adjacency_bonus;
+
+            #/ Apply bonus for matches after a separator
+            if (prevSeparator && 0 == index(word_separators, strAhead))
+                newScore += separator_bonus;
+
+            #/ Apply bonus across camel case boundaries. Includes "clever" isLetter check.
+            if (prevLower && strChar == strUpper && strLower != strUpper)
+                newScore += camel_bonus;
+
+            #/ Update pattern index IFF the next pattern letter was matched
+            if (nextMatch)
+                ++patternIdx;
+
+            #/ Update best letter in str which may be for a "next" letter or a "rematch"
+            if (newScore >= bestLetterScore) {
+
+                #/ Apply penalty for now skipped letter
+                if (bestLetter != null)
+                    score += unmatched_letter_penalty;
+
+                bestLetter = strChar;
+                bestLower = tolower(bestLetter);
+                bestLetterIdx = strIdx;
+                bestLetterScore = newScore;
+            }
+
+            prevMatched = 1;
+        }
+        else {
+            #/ Append unmatch characters
+            formattedStr = formattedStr strChar;
+
+            score += unmatched_letter_penalty;
+            prevMatched = 0;
+        }
+
+        #/ Includes "clever" isLetter check.
+        prevLower = strChar == strLower && strLower != strUpper;
+        prevSeparator = index(word_separators, strChar) > 0;
+        separatorAhead = index(word_separators, strChar) > 0; #+
+
+        ++strIdx;
+    }
+
+    #/ Apply score for last match
+    if (bestLetter) {
+        score += bestLetterScore;
+        matchedIndices[++nMatchedIndices] = bestLetterIdx;
+    }
+
+    #/ Finish out formatted string after last pattern matched
+    #/ Build formatted string based on matched letters
+    formattedStr = "";
+    if(requestFormattedStr) {
+        lastIdx = 1;
+        for (i = 1; i <= nMatchedIndices; ++i) {
+            idx = matchedIndices[i];
+            #formattedStr = formattedStr substr(str, lastIdx, idx - lastIdx) "<b>" substr(str, idx, 1) "</b>";
+            #formattedStr = formattedStr substr(str, lastIdx, idx - lastIdx) "(" substr(str, idx, 1) ")";
+            formattedStr = formattedStr substr(str, lastIdx, idx - lastIdx) substr(str, idx, 1) \
+              (byVal[4] = "\314\262"); #bash: printf "\u0332" | od -b ; unicode combining low line
+
+            lastIdx = idx + 1;
+        }
+        byVal[3] = formattedStr = formattedStr substr(str, lastIdx, length(str) - lastIdx + 1);
+    }
+
+    # Sum up scores by field
+    FieldScore[fieldIdx] = score;
+    for(i = fieldIdx - 1; i > 0; i--) {
+      score += FieldScore[i]
+    }
+
+    matched = patternIdx > patternLength;
+    byVal[1] = matched; byVal[2] = score
+    return matched;
+}
+
+#gawk]]]' # [[[2]]]
+fi
+}
+write_query_script fzf && mv "$AWKQ" "$AWKZe"
+write_query_script v1-fuzzy && mv "$AWKQ" "$AWKZ"
+write_query_script v1-exact
+
+# Prepare the built-in FNRSAVEFLT save filter script. [[[1
+> "${AWK4}" printf %s\\n '#[[[gawk
+# Usage: gawk -f "$AWK4" [CUT="..."] [RDR="..."] "\${file}"
+#   SAVEFLT_<source-id>="\$FNRSAVEFLT [CUT\"=i,j,k,...\"] [RDR=\"<redirection>\"] \"${file}\""
+#
 # "CUT=i,j,k,..." selects which fields to print:
 # Positive indexes select source-defined fields.
 # Negative indexes select tree widget item fields in reverse order.
 # Thus -1 is the icon, and -4 is the item label.
 # "\t" (tab) is the output field separator.
 #
-# Typical redirections:
-# RDR=">/dev/stderr" or RDR=">/path/to/output/file"
+# <redirection> defines the output sink. Typical <redirection>s:
+# RDR="none" or RDR="@timestamp" (default)
+# RDR=">/path/to/output/file" (including /dev/stderr, etc.)
 # RDR="|xclip" or RDR="|/path/to/executable-file"
+#
+# Examples: see SAVEFLT_FNRstart, SAVEFLT_FNRsc, SAVEFLT_filmstrip.
 
-BEGIN {
+BEGINFILE {
   FS = "|"
-  CUT=ENVIRON["CUT"]
-  RDR=ENVIRON["RDR"]
-  n = split(CUT, f, /,/)
-  if(match(RDR, /^[ \t]*[|]/)) {
-    redirect = "piper"
-  } else if(match(RDR, /^[ \t]*[>]/)) {
-    redirect = "printer"
-  } else {
-    printf "'"$(gettext "%s: invalid SAVEFLT redirection '%s'\n")"'", \
-      ENVIRON["ID"], RDR > "/dev/stderr"
-    exit(1)
+  if("" == CUT) {
+    # item label(-4), .desktop file fullpath(1), exec line(3), comments(4), categories(5)
+    CUT = "-4,1,3,4,5"
   }
-  RDR = substr(RDR, RSTART+RLENGTH)
+  if("" == RDR) {
+    RDR = "@timestamp"
+  }
+  n = split(CUT, f, /,/)
+  if(match(RDR, /^[[:blank:]]*[|][[:blank:]]*(.+)/, m)) {
+    redirect = "to_pipe"
+    RDR = m[1]; FILE = ""
+    exit_msg = "none"
+  } else if(match(RDR, /^[[:blank:]]*[>][[:blank:]]*(.+)/, m)) {
+    redirect = "to_tsv_file"
+    RDR = FILE = m[1]
+  } else if(match(RDR, /^[ \t]*[@]timestamp/)) {
+    # accept @timestamp only
+    RDR = FILE = "'"$HOME/$SN-"'"strftime("%F-%T")".tsv"
+    redirect = "to_tsv_file"
+  } else {
+    FILE = ""
+    exit_msg = sprintf("'"$i18n_invalid_SAVEFLT_redirection"'", ENVIRON["ID"], RDR)
+    exit
+  }
 }
 {
   # positive indexes
@@ -965,135 +1712,322 @@ BEGIN {
   while(!(++w>=NF)) {
     a[-w] = $(w)
   }
-  @redirect(f,a,n)
+  emit(f,a,n)
 }
-function piper(f,a,n,   i) { # [[[2
+ENDFILE {
+  close(RDR)
+  if("" != FILE) {
+    exit_msg = sprintf("'"$i18n_Search_results_saved_as"'", FILE)
+    icon = "gtk-ok"
+  } else {
+    icon = "gtk-dialog-warning"
+  }
+  if("none" != exit_msg) {
+    system("yad --text=\""exit_msg"\" --button=gtk-ok --window-icon="icon" --title=\"'"$APP_NAME"'\" --center --on-top --buttons-layout=center --borders=4 &")
+  }
+}
+function emit(f,a,n,   i) { # [[[2
   while(!(++i>=n)) {
-    printf "%s\t", a[f[i]] | RDR
+    @redirect(a[f[i]], "\t")
   }
   if(n) {
-    print a[f[n]] | RDR
+    @redirect(a[f[n]], "\n")
   }
 }
-function printer(f,a,n,   i) { # [[[2
-  while(!(++i>=n)) {
-    printf "%s\t", a[f[i]] > RDR
-  }
-  if(n) {
-    print a[f[n]] > RDR
-  }
+function to_pipe(f, s) {
+  gsub(/\t/, "\\t", f) # defensive, since field could embed \t
+  printf "%s%s", f, s | RDR
 }
-'
-
-# Helpers [[[1
-
-generate_get_drain_cmd() # [[[2
-{
-  # Echo sh code that extracts the drain command of the selected list item.
-  # Command is returned in "$@" - Command defined per plugin-dev.md.
-
-  # KLUDGE work around the peculiar Windows paths that winemenubuilder generates.
-  echo -n 'case $varLIST in *wine\ *\\\\\\\\*)'
-  echo -n ' varLIST=$(echo -n "$varLIST" | sed -e "s/\\\\\\\\/\\\\/g") ;;'
-  echo -n 'esac'
-
-  echo -n '; ifs="${IFS}"'
-  echo -n '; IFS="'"${SEP}"'"; set -f; set -- $varLIST; set -- $3; set +f'
-  echo -n '; IFS="${ifs}"'
+function to_tsv_file(f, s) { # [[[2
+  gsub(/\t/, "\\t", f) # defensive, since field could embed \t
+  printf "%s%s", f, s > RDR
 }
+#gawk]]]'
 
-generate_get_source() # [$1-event] [[[2
+# Private Helpers [[[1
+set_HELPINDEX_and_HELP_BUTTON_and_HELPVIEWER() #[[[2
 {
-  # Echo sh code that loads the current source's field values.
-  # Values are returned as shell variables - Values defined per plugin-dev.md.
-  local eventfmt
-  eventfmt="${1:+ on event:}$1${1:+ }"
-  [ -n "${DEBUG2}" ] && echo -n 'eval ">&2 echo \"GET SOURCE \${varF3:-0}'"${eventfmt}"'\"";'
-  [ -n "${DEBUG3}" ] && echo -n '>&2 echo "[["; set -x;'
-  echo -n ". \"${SRCSTEM}\"\${varF3:-0}-*.sh"
-  [ -n "${DEBUG3}" ] && echo -n '; set +x; echo >&2 "]]"'
+  # In:  ${FNRHELPINDEX} paths.
+  # Out: ${HELPVIEWER} command, ${HELP_BUTTON} gtk code.
+  local IFS=: subject="${i18n_Help%%_*}${i18n_Help##*_}" i x p s helpviewer hf hd
+  set -- ${FNRHELPINDEX}
+  for i; do
+    unset x p s helpviewer HELP_BUTTON; hf="$i"
+    case "${hf}" in *\[*\]*) p="${hf%[*}["; s="]${hf##*]}" # search for translation
+      [ -e "$p${LL}$s" ] && hf="$p${LL}$s"; [ -e "$p${LR}$s" ] && hf="$p${LR}$s"; [ -e "$p${LANG}$s" ] && hf="$p${LANG}$s" ;;
+    esac
+    if [ -e "${hf}" ]; then
+      hd="${TMPD}/help" && mkdir -p "${hd}" &&
+      case "${hf##*.}" in t[gx]z|[gx]z) tar -C "${hd}" -xaf "${hf}" && hf=$(set +f; echo "${hd}"/index.*) ;; esac &&
+      case "${hf##*.}" in md) x=${FNRMDVIEW:-mdview} ;; htm*) x=defaultbrowser;; esac
+      unset IFS # changing IFS is OK because we're going to exit the outer loop anyway
+      set -- $(which $x www-browser x-www-browser defaulttexteditor geany leafpad 2>&-)
+      helpviewer=$1
+      case ${helpviewer} in
+        '') helpviewer="${BROWSER:-xdg-open} '${hf}'";; # catchall
+        *mdview)
+          #  Usage: "$HELP_BUTTON<action>ACTION</action>OTHER_ACTIONS...</button>"
+          # ACTION: "<action>${HELPVIEWER:-:} \"\$HELPINDEX\" &</action>" # main index.md
+          # ACTION: "<action>${HELPVIEWER:-:} \"\$HELPINDEX\" \"\${PLGDIR:-...}/index.md\" &</action>" # +plugin's index.md, if any
+          # ACTION: "<action>${HELPVIEWER:-:} \"/path/to/topic.md\" &</action>" # topic.md only
+          helpviewer='v() { for a; do [ -e "$a" ] && [ -d "${a%/*}" ] && exec "'"$helpviewer"'" "$a" "" "'"$subject - $APP_TITLE"'" & sleep 0.4; done; }; v' ;;
+        *browser) helpviewer="'${helpviewer}' 'file://${hf}'" ;;
+        *) # dup help files to protect sources from text editors
+          if ! [ "${hf%/*}" = "${hd}" ]; then cp -fr "${hf%/*}/"* "${hd}/"; fi &&
+          helpviewer="cd '${hd}' && '${helpviewer}' 'no-help.md'" ;;
+      esac && HELPVIEWER=$helpviewer HELP_BUTTON="
+<button use-underline=\"true\">
+  <label>"$i18n_Help"</label>
+  <input file stock=\"gtk-help\"></input>"
+      break # on first valid help file path $hf found
+    fi
+  done
+  export HELPINDEX=$hf
+  ! [ "$HELP_BUTTON" ] && HELP_BUTTON='<button visible="false">'
 }
+#]]]
+set_HELPINDEX_and_HELP_BUTTON_and_HELPVIEWER
 
-generate_invoke_source_save_filter() # [[[2
+set_ABOUT_TEXT() # [[[2
 {
-  # Echo sh code that invokes source[varF3]'s save-filter-command.
-  # Unexport all vars.
-  echo -n "$UNEXPORT varLIST varF3 invokeTAP invokeDRAIN"
-  echo -n "; if [ -n \"\$SAVEFLT\" ]; then"
-  echo -n   " file=\"$F4SF\""
-  echo -n   "; FNRDEBUG=$FNRDEBUG"
-  echo -n   " FNRTMP=\"$TMPD\" FNRPID=$FNRPID FNRRPC=\"$FNRRPC\""
-  echo -n   " FNRSAVEFLT=\"$FNRSAVEFLT\" FNRXCLIP=\"$XCLIP\"" # specifically for save-filter
-  echo -n   " eval \$SAVEFLT"
-  echo -n '; fi'
+  # Text content for the About dialog.
+  # i18n About dialog widgets
+
+  local engine=${FNRFZF:-$i18n_builtin}
+  ! [ fzf = "$FNRSEARCHENGINE" ] && engine=$i18n_builtin
+  ABOUT_TEXT='printf "'"$i18n_gui_about"'"'\
+' "'"${APP_NAME}"'" "'"${Version}"'" "'"step, SFR, L18L"'"'\
+' "'"http://www.murga-linux.com/puppy/viewtopic.php?t=98330"'"'\
+' "'"https://github.com/step-/find-n-run"'" "'"${CONFIG}"'" | tr \\r \\n'\
+' ; printf "$(gettext "'"$i18n_search_engine"'")\n" "'"$engine"'"'\
+' ; n="'"${NSOURCES}"'"; printf "$(ngettext "'"$i18n_source_loaded"'" "'"$i18n_sources_loaded"'" "$n")\n" "$n"'\
+' ; set -- $(wc -l "'"${DATF}"'"); printf "$(ngettext "'"$i18n_application_found"'" "'"$i18n_applications_found"'" $1)\n" $1'
 }
+#]]]
+set_ABOUT_TEXT
 
-generate_invoke_source_tap() # [[[2
+set_GET_DRAIN_COMMAND() # [[[2
 {
-  # Echo sh code that invokes source[varF3]'s tap-command.
-  # Extract search input value as $term with IBOL+IBOL correction. [[[
-  echo -n 'ifs="${IFS}"; IFS="'"${IBOL}"'"; set -f; set -- ${varSEARCH}; for i; do term="$i"; done; set +f; set IFS="${ifs}";'
-  #]]]
-  # Get source[varF3]'s values. [[[
-# Optimization: use cached <variable>TAP</variable>.
-  generate_get_source invoke_source_tap
+  # Code that extracts the drain command of the selected list item.
+  # Command is returned in "$@" - Command defined per usr/share/findnrun/doc/plugin-dev.md.
+
+  # 1. KLUDGE work around the challenging Windows paths that winemenubuilder generates. [[[
+  # input: Exec=env WINEPREFIX="/home/spot/.wine" wine C:\\\\windows\\\\command\\\\start.exe /Unix /home/spot/.wine/dosdevices/c:/users/Public/Start\\ Menu/Programs/Calendar\\ Magic/Calendar\\ Magic.lnk
+  # output: env WINEPREFIX="/home/spot/.wine" wine C:\\windows\\command\\start.exe /Unix /home/spot/.wine/dosdevices/c:/users/Public/Start\ Menu/Programs/Calendar\ Magic/Calendar\ Magic.lnk
   # ]]]
-  # Start tap-command. [[[
-  echo -n ' && fnrevent=${invokeTAP:-Search} && fnrevent=${fnrevent%% *}' # trim timestamp
-  if [ -n "${DEBUG1}" ]; then #[[[
-    echo -n ' && >&2 printf %s "$(date +%H:%M:%S.%N) INVOKE TAP event=${fnrevent}"'
-    [ -n "${DEBUG3}" ] && echo -n ' && eval ">&2 echo -n \" term(hex)=\$(echo -n \${term} |xxd -p)\""'
-    echo -n ' && eval ">&2 echo \" term=\${term} \${TAP}\""'
-  fi
-  #]]]
-  # Unexport all vars.
-  # cf. UNEXPORT in generate_invoke_source_drain.
-  echo -n " && ${UNEXPORT} varLIST varF3 invokeTAP invokeDRAIN"
-  echo -n ' && FNREVENT="${fnrevent}" FNRDEBUG='"${FNRDEBUG}"
-  echo -n ' FNRTMP="'"${TMPD}"'" FNRPID=${FNRPID} FNRRPC="'"${FNRRPC}"'"'
-  echo -n ' eval ${TAP}'
-  #]]]
+  GET_DRAIN_COMMAND=\
+': 1;'\
+'case $varLIST in *wine\ *\\\\\\\\*)'\
+' varLIST=$(echo -n "$varLIST" | sed -e "s/\\\\\\\\/\\\\/g") ;;'\
+'esac'\
+';: 2'\
+'; ifs="${IFS}"'\
+'; IFS="'"${SEP}"'"; set -f; set -- $varLIST; set -- $3; set +f'\
+'; IFS="${ifs}"'
 }
+# ]]]
+set_GET_DRAIN_COMMAND
 
-generate_invoke_source_drain() # [[[2
+set_SELECT_NEXT_SOURCE() # [[[2
 {
-  # Echo sh code that invokes source[varF3]'s drain-command.
-  # Extract selected list item value as "$@".
-  generate_get_drain_cmd
-  # Unexport all vars but varF3 and varLIST.
-  # cf. 'UNEXPORT' in generate_invoke_source_tap and 'unset' further down
-  echo -n "; ${UNEXPORT}"
-  # Load source[varF3]'s values into drain's invocation environment. [[[
-  echo -n '; '; generate_get_source invoke_source_drain
-  # ]]]
-  # Save drain-command to history lists. [[[
-  # To the source's own history list file and to the global history list file
-  # $HSTF, which is the history widget input file (varCMD).
-  echo -n "; echo \$DRAIN\ \"\$@\" >> \"$TMPD/.hist-\$ID.sh\""
-  echo -n "; echo \$DRAIN \"\$@\" >> '$HSTF'"
-  #]]]
-  # Start drain-command. [[[
-  echo -n '; set -- ${DRAIN} "$@"'
+  # Code that advances the global pointer to the current source compiled declaration file.
+  SELECT_NEXT_SOURCE="set -- $VISIBLE_SOURCES; echo -n \$(((\${varF3} + 1) % \${#}))>'$F3SF'"
+}
+#]]]
+set_SELECT_NEXT_SOURCE
+
+set_LOAD_INVOCATION_ENV() # [[[2
+{
+  # Code that loads the current source's invocation environment as defined in usr/share/findnrun/doc/plugin-dev.md.
+  LOAD_INVOCATION_ENV=\
+${DEBUG3:+'>&2 echo "[["; set -x;'}\
+". \"${SRCSTEM}\"\${varF3:-0}-*.sh"\
+${DEBUG3:+'; set +x; echo >&2 "]]"'}
+  # Code that loads the next source's invocation environnment
+  LOAD_NEXT_INVOCATION_ENV=\
+". \"${SRCSTEM}\"\$(((\${varF3:-0} + 1) % \${NSOURCES:-${NSOURCES}}))-*.sh"
+}
+#]]]
+set_LOAD_INVOCATION_ENV
+
+set_INVOKE_SOURCE_SAVE_FILTER() # [[[2
+{
+  # Code that invokes the current source's save-filter-command.
+  # 0. Output plugin helpers.
+  # 1. Unexport some vars.
+  # 2. Set invocation environment and start save-filter-command.
+  INVOKE_SOURCE_SAVE_FILTER=\
+': 0'\
+";$FNRset_TMPD_DATF"\
+';: 1'\
+"$UNEXPORT $UNEXP_GUI1 $UNEXP_GUI2 $UNEXP_INVK $UNEXP_NOT_TAP"\
+';: 2'\
+"; $LOAD_INVOCATION_ENV"\
+"; if [ -n \"\$SAVEFLT\" ]; then"\
+" file=\"$F4SF\""\
+"; FNRDEBUG=$FNRDEBUG FNRTMP=\"$TMPD\" FNRPID=\$FNRPID FNRRPC=\"$FNRRPC\""\
+" FNRSAVEFLT=\"$FNRSAVEFLT\""\
+" eval \$SAVEFLT"\
+'; fi'
+}
+#]]]
+set_INVOKE_SOURCE_SAVE_FILTER
+
+set_REFRESH_SOURCE_VARS_FOR_INPUT_FILE() # [[[2
+{
+  # Echo sh code that writes each source field value to its own file, which
+  # gtkdialog <variable>s can read via <input file>.
+
+  # Match every variable assignment and print the assigned value to a file
+  # named after the variable name (plus prefix P).  Variable names with
+  # lowercase letters in them are ignored.  Each value is expected to be
+  # within (single) quotes, which are stripped when the value is written.
+  REFRESH_SOURCE_VARS_FOR_INPUT_FILE=\
+'awk -v P="'"$SVAR"'" "{'\
+'if(match(\$0,/^[A-Z0-9_]+=/)){'\
+'v=substr(\$0,RLENGTH+2,length(\$0)-RLENGTH-2);'\
+'f=(P)substr(\$0,1,RLENGTH-1);'\
+'print v >f;close(f)'\
+'}}" "'"$SRCSTEM"'"${varF3:-0}-*.sh'
+
+  # Touch the files to keep gtkdialog from complaining if they don't exist.
+  awk -v P="$SVAR" '{
+if(match($0,/<input file>\${SVAR}[^<]+/)){
+  f=(P)substr($0,RSTART+19,RLENGTH-19)
+  printf "">>f;close(f)
+}}' "$0"
+}
+#]]]
+set_REFRESH_SOURCE_VARS_FOR_INPUT_FILE
+
+set_INVOKE_SOURCE_TAP() # [[[2
+{
+  # Code that invokes the current source's tap-command.
+  # 0. Output plugin helpers.
+  # 1. Extract search input value as $term with IBOL+IBOL correction.
+  # 2. Get source's values.
+  # 3. Update plugin event. '%% *' trims the event timestamp.
+  # 4. Debug messages.
+  # 5. Unexport all vars but source's. Cf. UNEXPORT in set_INVOKE_SOURCE_DRAIN.
+  # 6. Set invocation environment and start tap-command.
+  INVOKE_SOURCE_TAP=\
+': 0'\
+";$FNRset_TMPD_DATF"\
+";$FNRsearch"\
+';: 1'\
+';ifs="${IFS}"; IFS="'"${IBOL}"'"; set -f; set -- ${varSEARCH}; for i; do term="$i"; done; set +f; set IFS="${ifs}"'\
+';: 2'\
+${DEBUG2:+'; eval ">&2 echo \"GET SOURCE \${varF3:-0} on event: invoke_source_tap\""'}\
+"; unset SKIP_INIT; $LOAD_INVOCATION_ENV"\
+' && : 3'\
+' && fnrevent=${invokeTAP:-Search} && fnrevent=${fnrevent%% *}'\
+' && : 4'\
+${DEBUG1:+' && >&2 printf %s "$(date +%H:%M:%S.%N) INVOKE TAP event=${fnrevent}"'}\
+${DEBUG3:+' && eval ">&2 echo -n \" term(hex)=\$(echo -n \${term} |xxd -p)\""'}\
+${DEBUG1:+' && eval ">&2 echo \" term=\${term} \${TAP}\""'}\
+'&& : 5'\
+" && $UNEXPORT $UNEXP_GUI1 $UNEXP_GUI2 $UNEXP_INVK"\
+'&& : 6'\
+' && FNREVENT="${fnrevent}" FNRDEBUG='"${FNRDEBUG}"\
+' FNRTMP="'"${TMPD}"'" FNRPID=${FNRPID} FNRRPC="'"${FNRRPC}"'"'\
+' eval ${TAP}'
+}
+#]]]
+set_INVOKE_SOURCE_TAP
+
+set_SAVE_ARGS_HISTORY() # [[[2
+{
+  # Code that saves "$@" the history files.
+  SAVE_ARGS_HISTORY=\
+'echo "$@" >> "'"$HSTF"'" && echo "$@" >> "'"$TMPD"'/.hist-$ID.sh"'
+}
+#]]]
+set_SAVE_ARGS_HISTORY
+
+set_EVAL_ARGS_IN_TERM() # $1-terminal-prog+opts [[[2
+{
+  # Code that runs "$@" in a terminal.
+  # Write the code to a private file that gtkdialog will source.
+  # "$@"'s exit status is saved to $TMPD/.eval-args-term-exit-status. However, be wary
+  # that some terminals, i.e., urxvtc, return control to the calling process immediately.
+
+  local __terminal=$1 __outf="$TMPD"/.eval-args-term
+  EVAL_ARGS_IN_TERM=". \"$__outf\""
+  > "$__outf" printf %s \
+"$__terminal -T \"\$1\" -e ${SHELL:-sh} -c "\
+"'"\
+'"$@"'\
+'; echo $? > "'"${__outf}"'-exit-status"'\
+'; printf "\033[7m'"$i18n_Key_Enter_to_close_terminal"'\033[0m" "'"$i18n_Findnrun"'"' \
+'; read x'\
+"'"\
+" $SN"' "$@"'
+}
+#]]]
+set_EVAL_ARGS_IN_TERM "$TERMINAL_PROGRAM"
+
+set_INVOKE_SOURCE_DRAIN() # [$1-terminal-prog+opts] [[[2
+{
+  # Code that invokes the current source's drain-command, optionally in a terminal window.
+  # Write the code to a private file that gtkdialog will source.
+  # Pass $1 to set INVOKE_SOURCE_DRAIN_TERM.
+
+  # 0. No plugin helpers for drain-command because it can't make use of them since it
+  #    must be a simple shell command.  Cf. caveat in plugin-dev.md "Plugin Invocation".
+  # 1. Extract selected list item value as "$@".
+  # 2. Unexport some vars.  Cf. UNEXPORT in set_INVOKE_SOURCE_TAP and also further down below.
+  # 3. Load source's values into drain's invocation environment.
+  # 4. Update plugin event. '%% *' trims the event timestamp. [[[
   # NOTE: v.2.0.0 main window's gtkdialog doesn't implement variable
   # invokeDRAIN. So, for the plugin interface, here it's sufficient to
   # pretend that invokeDRAIN is implemented, and handle it similarly to
-  # what we do for invokeTAP, which instead is fully implemented.
-  echo -n '; fnrevent=${invokeDRAIN:-Activate} && fnrevent=${fnrevent%% *}' # trim timestamp
-  if [ -n "${DEBUG1}" ]; then #[[[
-    echo -n ' && >&2 printf %s $(date +%H:%M:%S.%N)'
-    echo -n ' && eval ">&2 echo \" INVOKE DRAIN event=${fnrevent} \${DRAIN} \$@ \""'
+  # what we do for invokeTAP, which instead is fully implemented. ]]]
+  # 5. Set and export invocation environment.
+  # 6. Save drain-command to history lists.
+  # 7. Debug messages.
+  # 8. Unexport all remaining variables.
+  # 9. Start drain-command (optionally in terminal).
+  local __terminal=$1 __term_suffix=${1:+_term} __outf=$TMPD/.run-drain${1:+-term}.sh
+  if [ "$__terminal" ]; then
+    INVOKE_SOURCE_DRAIN_TERM=". \"$__outf\""
+  else INVOKE_SOURCE_DRAIN=". \"$__outf\""
   fi
-  #]]]
-  echo -n '; unset varF3 varLIST invokeTAP invokeDRAIN TAP DRAIN ICON TITLE INITSEARCH MODE PLGDIR SAVEFLT'
-  echo -n '; FNREVENT="${fnrevent}" FNRDEBUG='"${FNRDEBUG}"
-  echo -n ' FNRTMP="'"${TMPD}"'" FNRPID=${FNRPID} FNRRPC="'"${FNRRPC}"'"'
-  echo -n ' eval "$@" &'
-  #]]]
+  > "$__outf" printf %s \
+': 0'\
+' drain-command must be a simple shell command'\
+';: 1'\
+";$GET_DRAIN_COMMAND"\
+';: 2'\
+"; $UNEXPORT $UNEXP_GUI1 $UNEXP_NOT_TAP"\
+';: 3'\
+${DEBUG2:+'; eval ">&2 echo \"GET SOURCE \${varF3:-0} on event: invoke_source_drain'$__term_suffix'\""'}\
+";$LOAD_INVOCATION_ENV"\
+';: 4'\
+'; fnrevent=${invokeDRAIN:-Activate} && fnrevent=${fnrevent%% *}'\
+';: 5'\
+'; export FNREVENT="${fnrevent}" FNRDEBUG='"${FNRDEBUG}"\
+' FNRTMP="'"${TMPD}"'" FNRPID=${FNRPID} FNRRPC="'"${FNRRPC}"'"'\
+';: 6'\
+'; eval set -- ${DRAIN} "$@"; '"$SAVE_ARGS_HISTORY"\
+';: 7'\
+${DEBUG1:+' && >&2 printf %s $(date +%H:%M:%S.%N)'}\
+${DEBUG1:+' && eval ">&2 echo \" INVOKE DRAIN event=${fnrevent} \${DRAIN:-DRAIN==NULL} \$@ \""'}\
+';: 8'\
+"; $UNEXPORT $UNEXP_GUI2 $UNEXP_INVK"\
+';: 9;'
+  if [ "$__terminal" ]; then
+    >> "$__outf" printf %s " $EVAL_ARGS_IN_TERM"
+  else
+    >> "$__outf" printf %s ' "$@" &'
+  fi
 }
+#]]]
+set_INVOKE_SOURCE_DRAIN
+set_INVOKE_SOURCE_DRAIN "$TERMINAL_PROGRAM"
 
-generate_status_bar() # [[[2
+set_STATUS_BAR() # [[[2
 {
-  # Echo sh code that loads the current and next source's titles
+  # XML fragment + Code that loads the current and next source's titles
   # and sets them as navigation hotkey labels.
   set -- ${VISIBLE_SOURCES:-FNRStart}
   [ $# -lt 2 ] && return # no status bar unless:
@@ -1101,105 +2035,247 @@ generate_status_bar() # [[[2
   #i18n Status bar: Ctrl+0... and F3... hotkeys
   local ctrlnkey funckey keysymF3 tooltip
   keysymF3=${HOTKEY_F3#*:}; keysymF3=${keysymF3%:*}
-  ctrlnkey=$(gettext "[ctrl+%d]") funckey=$(gettext "[%s]")
-  tooltip=$(printf "$(gettext \
-    "Click the status bar or press a hotkey to activate the next source.\n%s\n%s")" \
-    "$(n="${NSOURCES}"; printf "$(ngettext "%s source loaded" "%s sources loaded" "$n")" "$n")" \
-    "$(n="${NDATF}"; printf "$(ngettext "%s application found" "%s applications found" "$n")" "$n")" \
+  ctrlnkey=$i18n_ctrl_digit funckey=$i18n_boxed_string
+  tooltip=$(printf \
+    "$i18n_Click_the_status_bar" \
+    "$(n="${NSOURCES}"; printf "$(ngettext "$i18n_source_loaded" "$i18n_sources_loaded" "$n")" "$n")" \
   )
-  echo -n '
+  #]]]
+  # 1. Title - TITLE is a gtkdialog widget sub-shell variable [[[
+  #    It's set by the <input> tag, which is activated only after
+  #    refresh:TITLE.  Adding a <default> tag value for TITLE would initialize
+  #    its **widget** value but not its findnrun sh value.  Since the code
+  #    deals with the gtkdialog sh value it deals with the null value case,
+  #    which occrs once when gtkdialog starts. ]]]
+  # 2. Load next source's values and grab its TITLE too.
+  # 3. Format titles as hotkey labels. <action>s copied from <menuitem> HOTKEY_F3.
+  STATUS_BAR='
     <vbox>
       <eventbox>
         <statusbar has-resize-grip="false" sensitive="false" tooltip-text="'"$tooltip"'">
           <variable export="false">varSBAR</variable>
-          <input>'
-  [ -n "${DEBUG3}" ] && echo -n 'echo >&2 "=== GENERATE STATUS BAR [["; set -x;'
-  echo -n 'title="${TITLE}"' # This is a gtkdialog sh variable and...
-  # [[[ ... it gets its value from the <input> tag, which is activated only
-  # after refresh:TITLE. Adding a <default> tag value for TITLE doesn't
-  # initialize its **sh value**. It only initializes its **widget** value.
-  # Again, here we deal with the gtkdialog sh value, so we need to be
-  # prepared to the null value case, which manifests itself only once,
-  # when gtkdialog starts. Here it goes.
-  #]]]
-  echo -n '; [ -z "${title}" ] && . "'"${SRCSTEM}"'"${varF3:-0}-*.sh && title="${TITLE}"'
-  # Load next source's values
-  echo -n '; . "'"${SRCSTEM}"'"$(((${varF3:-0} + 1) % ${NSOURCES:-'${NSOURCES}'}))-*.sh'
-  echo -n '; next="${TITLE}"'
-  # Send formatted data to SBAR.
-  echo -n '; printf "'"%s ${ctrlnkey}  »  ${funckey} %s"'" "${title}" $((${varF3}+1)) "'"${keysymF3}"'" "${next}"'
-  [ -n "${DEBUG3}" ] && echo -n 'set +x; echo >&2 "]]";'
-  echo "</input>
+          <input>'\
+': 1'\
+${DEBUG3:+'; echo >&2 "=== GENERATE STATUS BAR [["; set -x'}\
+'; title="${TITLE}"'\
+'; [ -z "${title}" ] && SKIP_INIT=1 '"$LOAD_INVOCATION_ENV"' && title="${TITLE}"'\
+';: 2'\
+'; SKIP_INIT=1 '"$LOAD_NEXT_INVOCATION_ENV"\
+'; next="${TITLE}"'\
+';: 3'\
+'; printf "'"%s ${ctrlnkey} » ${funckey} %s      %s"'" "${title}" $((${varF3}+1)) "'"${keysymF3}"'" "${next}" "'"$i18n_MenuKey $i18n_hotkeys"'"'\
+${DEBUG3:+'; set +x; echo >&2 "]]"'}\
+"</input>
         ${DEBUG2:+<action>echo>&2 ,,, varSBAR ,,,</action>}
         </statusbar>
-        <action signal=\"button-press-event\">set -- $VISIBLE_SOURCES; echo -n \$(((\${varF3} + 1) % \${#}))>'$F3SF'</action>
+        <action signal=\"button-press-event\">$SELECT_NEXT_SOURCE</action>
         <action signal=\"button-press-event\">refresh:varF3</action>
       </eventbox>
     </vbox>" # Copy <action>s from <menuitem> HOTKEY_F3.
-  #]]]
 }
+#]]]
+set_STATUS_BAR
 
-generate_source_hotkeys() # [[[2
+set_SOURCE_HOTKEYS() # [[[2
 {
   # Actions for keys Ctrl+1..Ctrl+9
-  local h i
-  h=0
-  for i in 1 2 3 4 5 6 7 8 9; do
-    echo '<menuitem accel-key="0x003'"$i"'" accel-mods="4">'
-    printf "  <action>%s</action>\n" "echo -n $h >\"${F3SF}\"" "refresh:varF3"
-    echo "</menuitem>"
-    [ $i = $NSOURCES ] && break
+  local h i title
+  h=0 SOURCE_HOTKEYS=
+  while read title; do
+    i=$((h+1))
+    SOURCE_HOTKEYS="$SOURCE_HOTKEYS
+<menuitem label=\"$title\" accel-key=\"0x003$i\" accel-mods=\"4\">
+  <action>printf $h >\"${F3SF}\"</action>
+  <action>refresh:varF3</action>
+</menuitem>"
     h=$i
-  done
+  done < "$TTLF"
+}
+#]]]
+set_SOURCE_HOTKEYS
+
+set_LET_NV() # [[[2
+{
+  # Awk code that sets a value in a shell file, such as $CONFIG, e.g. gtkdialog code:
+  # <checkbox>
+  #   <variable>SEARCHFUZZY</variable>
+  #   <action>awk '$LET_NV' N=SEARCHFUZZY V=\$SEARCHFUZZY '$CONFIG'</action>
+  # </checkbox>
+  LET_NV=\
+'$0~"^"N"="{$0=N"="V;f=1}{a[++n]=$0}END{if(!f)a[++n]=N"="V;++n;for(i=1;i!=n;i++)print a[i]>ARGV[ARGC-1]}'
+}
+#]]]
+set_LET_NV
+
+start_check_fzf_window() # Returns when gtkdialog terminates [[[2
+{
+  local dialog program
+  dialog="${TMPD}/.check-fzf.xml"
+  program="$TMPD/check-fzf"
+  # Link to rename GTKDIALOG "$program" in ps/htop process list.
+  ln -sf "$(command -v $GTKDIALOG)" "$program"
+  echo "$CHECK_FZF_WINDOW" > "$dialog" &&
+  if [ ${FNRDEBUG:-0} -gt 9 ]; then
+    echo "$CHECK_FZF_WINDOW" | tr \\r \\n
+    return
+  fi &&
+  "$program" -f "$dialog" &
+  wait
 }
 
-start_window() # Returns when gtkdialog terminates [[[2
+set_DO_CHECK_FZF_WINDOW() # [[[2
 {
-  local dialog findnrun
+DO_CHECK_FZF_WINDOW=': placeholder'
+}
+#]]]
+set_DO_CHECK_FZF_WINDOW
+! [ false = "$CHECK_FZF" ] && CHECK_FZF=true
+
+start_main_window() # Returns when gtkdialog terminates [[[2
+{
+  if [ "${DEBUG1}" ]; then
+    TIMER1=$(date +%s.%N)
+    : >/tmp/varSEARCH
+    echo >&2 "==== STARTING GTKDIALOG - DEBUG SEARCH INPUT ENABLED ===="
+    timer $TIMER2 $TIMER1 $TIMER0 "+since last split time" >&2
+echo >&2 "You can \"type a search\" by writing a term to file /tmp/varSEARCH.
+Limit $APP_NAME to a single instance because /tmp/varSEARCH can't be shared.
+Debug tip: Dump gtkdialog XML: FNRDEBUG=10 $SN | gvim -R -
+----"
+  fi
+  local dialog program
   dialog="${TMPD}/.main.xml"
-  findnrun="$TMPD/${0##*/}"
-  ln -sf "$(command -v $GTKDIALOG)" "$findnrun"
+  program="$TMPD/${0##*/}"
+  # Link to rename GTKDIALOG "$program" in ps/htop process list.
+  ln -sf "$(command -v $GTKDIALOG)" "$program"
   cat > "${dialog}" &&
   if [ ${FNRDEBUG:-0} -gt 9 ]; then
-    cat
+    { cat "$dialog"
+      echo "$RESTART_WINDOW"
+      echo "$GUI_ABOUT"
+    } | tr \\r \\n
     return
   fi &&
   if [ "${ENABLESTDOUT}" ]; then
-    "$findnrun" ${GEOMETRY:+--geometry=}${GEOMETRY} ${CMDLINEOPTS} -f "${dialog}" &
+    "$program" ${GEOMETRY:+--geometry=}${GEOMETRY} ${CMDLINEOPTS} -f "${dialog}" &
   else
-    "$findnrun" ${GEOMETRY:+--geometry=}${GEOMETRY} ${CMDLINEOPTS} -f "${dialog}" >/dev/null &
+    "$program" ${GEOMETRY:+--geometry=}${GEOMETRY} ${CMDLINEOPTS} -f "${dialog}" >/dev/null &
   fi
-  mv "$TMPD/.$$" "$TMPD/.$$-$!" # track PPID-PID
-  wait # for traps to PID
+  mv "$TMPD"/.$$ "$TMPD/.$$-$!" # track PPID(script)-PID(gtkdialog)
+  if [ "${FNRDEBUG}" ]; then
+    echo "$RESTART_WINDOW" > "${dialog%.xml}"_RESTART_WINDOW.xml
+    echo "$GUI_ABOUT" > "${dialog%.xml}"_GUI_ABOUT.xml
+  fi
+  wait # for traps on gtkdialog's PID
 }
 
-generate_restart_window() # [[[2
+set_DO_RESTART_WINDOW() # [[[2
 {
-  # Restart findnrun dialog with all command line arguments.
-  printf %s \
-    "for pid in $TMPD/.$$-*; do :; done" \
-    '; pid=${pid##*-}' \
-    "; cat /proc/$$/cmdline | xargs -0 env -- &" \
-    ' kill $pid'
+  # Code to restart findnrun dialog with all command line arguments.
+  # We use 'cat |' because the gtkdialog parser considers character '<' illegal.
+  # .$$-* is PPID(script)-PID(gtkdialog); if gtkdialog isn't running, PID == "*".
+DO_RESTART_WINDOW=\
+"for pid in $TMPD/.$$-*; do :; done"\
+'; pid=${pid##*-}'\
+"; cat /proc/$$/cmdline | xargs -0 env -u varSEARCH -- &"\
+' [ "*" != "$pid" ] && kill $pid'
 }
+#]]]
+set_DO_RESTART_WINDOW
 
-# Restart window dialog. [[[1
-# i18n restart window dialog
+set_REQUEST_RESTART_WINDOW() # [[[2
+{
+  # Code to request the main window to restart itself.
+  # Usage: <action>$REQUEST_RESTART_WINDOW ["message text"]</action>
+  REQUEST_RESTART_WINDOW="F(){ printf %b >'$RWMF' \"\$@\" && echo 1 >>'$RWMF-trigger'; }; F "
+  # Init for gtkdialog.
+  : > "$RWMF" && : > "$RWMF-trigger"
+  # Gtkdialog timer RESTART_WINDOW0 will serve the requests.
+}
+set_REQUEST_RESTART_WINDOW
+
+# Dialogs [[[1
+# About dialog. [[[2
+# i18n About dialog.
+export GUI_ABOUT='
+<window title="'"$i18n_About_and_help - ${APP_TITLE}"'" icon-name="findnrun" window-position="2">
+  <vbox>
+    <frame>
+      <text xalign="0" selectable="true" can-focus="false">
+        <variable export="false">about_text</variable>
+        <input>'"${ABOUT_TEXT}"'</input>
+      </text>
+    </frame>
+    <hbox homogeneous="true">
+      <text space-fill="true" space-expand="true"><label>""</label></text>
+      <button use-underline="true">
+        <label>"'"$i18n_OK"'"</label>
+        <input file stock="gtk-ok"></input>
+        <action>closewindow:GUI_ABOUT</action>
+      </button>
+      '"${HELP_BUTTON}
+        <action>${HELPVIEWER:-:}"' "$HELPINDEX" "${PLGDIR:-...}/index.md" &</action>
+        <action>closewindow:GUI_ABOUT</action>
+      </button>
+      <text space-fill="true" space-expand="true"><label>""</label></text>
+    </hbox>
+  </vbox>
+  <variable>GUI_ABOUT</variable>
+  <action signal="key-press-event" condition="command_is_true([ $KEY_SYM = Escape ] && echo true )">closewindow:GUI_ABOUT</action>
+</window>'
+
+# Check fzf window dialog. [[[2
+# i18n check fzf window dialog
+CHECK_FZF_WINDOW='
+<window title="'"$APP_TITLE"'" icon-name="findnrun" resizable="false" window-position="1">
+  <vbox>
+    <frame>
+      <text justify="0">
+        <label>"'"$i18n_Check_fzf_text"'"</label>
+      </text>
+    </frame>
+    <checkbox use-underline="true">
+      <label>"'"$i18n_Show_this_at_next_start"'"</label>
+      <default>'"$CHECK_FZF"'</default>
+      <variable>CHECK_FZF</variable>
+      <action>awk '"'$LET_NV'"' N=CHECK_FZF V=$CHECK_FZF "'"$CONFIG"'"</action>
+    </checkbox>
+    <text><label>""</label></text>
+    <hbox>
+      <text space-fill="true" space-expand="true"><label>""</label></text>
+      <button yes>
+        <action>('"$DO_CHECK_FZF_WINDOW"')&</action>
+        <action>exit:0</action>
+      </button>
+      <button no>
+        <action>exit:1</action>
+      </button>'"$HELP_BUTTON
+        <action>${HELPVIEWER:-:} \"\${HELPINDEX%index.md}fzf.md\" &</action>
+      </button>"'
+      <text space-fill="true" space-expand="true"><label>""</label></text>
+    </hbox>
+  </vbox>
+  <variable>CHECK_FZF_WINDOW</variable>
+  <action signal="key-press-event" condition="command_is_true([ $KEY_SYM = Escape ] && echo true )">closewindow:CHECK_FZF_WINDOW</action>
+</window>'
+
+# Restart main window dialog. [[[2
+# i18n restart main window dialog
 export RESTART_WINDOW='
-<window title="'"$APP_TITLE"'" icon-name="edit-find" resizable="false" window-position="2">
+<window title="'"$APP_TITLE"'" icon-name="findnrun" resizable="false" window-position="2">
   <vbox>
     <text wrap="true" xalign="0">
       <variable export="false">RESTART_WINDOW_MESSAGE</variable>
       <input>2>/dev/null head -n 1 "'"$TMPD/.msg_restart"'"</input>
     </text>
     <text justify="0">
-      <label>"     '"$(gettext "Restart Findnrun?")"'     "</label>
+      <label>"     '"$i18n_Restart_Findnrun"'     "</label>
     </text>
     <text><label>""</label></text>
     <hbox>
       <text space-fill="true" space-expand="true"><label>""</label></text>
       <button yes>
-        <action>'"$(generate_restart_window)"'</action>
+        <action>'"${DO_RESTART_WINDOW}"'</action>
       </button>
       <button no>
         <action>closewindow:RESTART_WINDOW</action>
@@ -1211,22 +2287,55 @@ export RESTART_WINDOW='
   <action signal="key-press-event" condition="command_is_true([ $KEY_SYM = Escape ] && echo true )">closewindow:RESTART_WINDOW</action>
 </window>'
 
-# Prepare and show the main window. [[[1
+# Check / Install fzf. [[[1
+install_fzf() # [[[2
+{
+  local install="${0%/*}/../share/$SN/install-fzf" # no readlink -f! installs $target
+  ! [ -x "$install" ] && : "insufficient access rights?" && return 1
+  local bin="${install%share/$SN/install-fzf}"bin
+  local name="$bin"/fzf target="${install%/*}"/bin/fzf do="$TMPD/.install-fzf"
+  # Install $target. Link it in PATH unless a real file by the same $name already exists.
+  echo "\"$install\" --bin; [ -x \"$target\" ] && ! [ -f \"$name\" ] && ln -sfT \"$target\" \"$name\"" > "$do.1" &&
+  echo "set -- \"$do.1\" && $EVAL_ARGS_IN_TERM" > "$do.2" &&
+  chmod +x "$do.1" "$do.2" &&
+  if command -v gtksu >/dev/null && [ $(id -u) -ne 0 ]; then
+    gtksu "$i18n_root_access_rights_needed" "$do.2"
+  else
+    "$do.2"
+  fi
+} #]]]2
+
+if [ fzf = "$FNRSEARCHENGINE" -a true = "$CHECK_FZF" -a ! "$FNRFZF" ]; then
+  if start_check_fzf_window | grep -Fq 'EXIT="0"'; then
+    install_fzf
+    set_FNRFZF
+    if [ "$FNRFZF" ]; then
+      # restart findnrun with its command-line parameters
+      xargs -0 env -u varSEARCH -- < /proc/$$/cmdline &
+      exit # via trap_handler
+    fi
+  fi
+fi
+
+# Prepare and show the main window with hotkeys. [[[1
 # Tip: if your /bin/sh is bash you can use the following stanza in
-# <action>s, <input>s, etc. to print the execution line on stderr:
+# <action>s, <input>s, etc. to print the execution line to stderr:
 #   <action>${DEBUG1:+echo >&2 \$BASH_EXECUTION_STRING;}commands...</action>
 unset showcategories
 [ true = "$SEARCHCATEGORIES" -o true = "$SEARCHCOMPLETE" ] && showcategories=true
 [ hidden = "${SEARCHCATEGORIES}" ] && unset showcategories
+[ fzf = "$FNRSEARCHENGINE" -a "$FNRFZF" ] && unset need_restart || need_restart=1
 # i18n Main window widgets
 # i18n "0" (invisible, disregard).
-gettext 0 >/dev/null # work around an xgettext's limitation
-start_window << EOF
-<window title="${APP_TITLE}" icon-name="edit-find" window-position="2">
+gettext 0 >/dev/null # work around an xgettext limitation
+# Ensure that we have a unique title handle to the window
+xwininfo -name "$APP_TITLE" >/dev/null 2>&1 && APP_TITLE_UNIQ="$APP_TITLE [$$]"
+start_main_window << GTKDIALOGDOC
+<window title="${APP_TITLE_UNIQ:-$APP_TITLE}" icon-name="findnrun" window-position="2">
   <vbox>
     ${REMARK# [[[. varSEARCH: progressive typing search input field.}
     <hbox spacing="0">
-      <entry auto-refresh="${DEBUG1:+true}" tooltip-text="$(gettext "Press ENTER to select")">
+      <entry auto-refresh="${DEBUG1:+true}" tooltip-text="$i18n_Press_ENTER_to_select">
         ${REMARK# [[[. Entering IBOL+IBOL makes the search input field}
         ${REMARK# ignore all characters to the left of IBOL+IBOL included.}
         ${REMARK# IBOL stands for Ignore To Beginning Of Line. Its default}
@@ -1234,7 +2343,7 @@ start_window << EOF
         ${REMARK# gtkdialog. Here we append IBOL+IBOL to the default search}
         ${REMARK# term so that the entire value --which is simply a help tip}
         ${REMARK# is ignored, and the search engine can perform a clean query.}
-        <default>$(gettext "Type some letters to refine the list")${IBOL}${IBOL}</default>
+        <default>$i18n_Type_some_letters${IBOL}${IBOL}</default>
         ${REMARK# ]]]}
         <variable>varSEARCH</variable>
         ${REMARK# The entry widget ignores initial input unless it is refreshed, see varSEARCH0.}
@@ -1245,27 +2354,26 @@ start_window << EOF
         <action signal="activate">grabfocus:varLIST</action>
         <action signal="activate">echo false>"${FCSF}"</action>
       </entry>
-      <button tooltip-text="$(gettext "Clear entry")" stock-icon-size="1">
+      <button tooltip-text="$i18n_Clear_entry    ${i18n_info} ${i18n_MenuKey}" stock-icon-size="1">
         <input file stock="gtk-clear"></input>
-        <action>grabfocus:varSEARCH</action>
-        <action>clear:varSEARCH</action>
+        <action>enable:varF6</action>
       </button>
     </hbox>
     ${REMARK# ]]]}
     ${REMARK# [[[. varLIST: list tap-data records; invoke selected.}
-    <tree enable-search="false" exported-column="2" column-visible="1|1|0" headers-visible="false" icon-column-name="gtk-apply" hscrollbar-policy="1" vscrollbar-policy="1" tooltip-text="$(gettext "Press ENTER or double-click to run the selected item")">
-      ${REMARK# Column names below. Only Reserved and Label are visible.}
+    <tree enable-search="false" exported-column="2" column-visible="1|1|0" headers-visible="false" icon-column-name="gtk-apply" hscrollbar-policy="1" vscrollbar-policy="1" tooltip-text="$i18n_Press_ENTER_or_double_click">
+      ${REMARK# Column names below. Only Label and Reserved are visible. Reserved is used for fuzzy search details.}
       ${REMARK# Consider also that there is an icon column, so a full input}
-      ${REMARK# record is defined as Icon|Reserved|Label|PackedValues }
-      <label>Reserved|Label|PackedValues</label>
+      ${REMARK# record is defined as Icon|Label|Reserved|PackedValues }
+      <label>"Label|Reserved|PackedValues"</label>
       <variable>varLIST</variable>
       <output file>$F4SF</output>
       ${REMARK# [[[. Populate list view.}
-      <input icon-column="0">$(generate_invoke_source_tap)</input>
+      <input icon-column="0">${INVOKE_SOURCE_TAP}</input>
       ${REMARK# ]]]}
       ${DEBUG2:+<action>echo>&2 ,,, varLIST ,,,</action>}
       ${REMARK# [[[. Invoke list view selected item.}
-      <action signal="row-activated">$(generate_invoke_source_drain)</action>${REMARK# which saves item to history.}
+      <action signal="row-activated">${INVOKE_SOURCE_DRAIN}</action>${REMARK# which saves item to history.}
       <action signal="row-activated">refresh:varCMD</action>
       ${REMARK# ]]]}
       <action condition="active_is_false(varOPEN)">exit:EXIT</action>
@@ -1294,24 +2402,31 @@ start_window << EOF
     <hbox space-fill="false" space-expand="false">
       ${REMARK# This widget doubles as a varLIST item grabber and as a pull-down history list.}
       ${REMARK#  [[[. Pull-down list and input entry field combo.}
-      <comboboxentry space-expand="true" space-fill="true" tooltip-text="$(gettext "Press the Down Arrow key to grab the selected item and move through the history list. You can edit the grabbed entry. History persists while the program is running. History is cleared on exit.")">
+      <comboboxentry space-expand="true" space-fill="true" tooltip-text="$i18n_Press_the_Down_Arrow_key">
         <variable>varCMD</variable>
-        <default>$(gettext "Press Down Arrow to grab selected item")</default>
+        <default>$i18n_Press_Down_Arrow</default>
         ${REMARK# Append a space to the grabbed varLIST item \$@ so we can tell it from history items.}
         ${REMARK# Note that the entry widget discards trailing spaces, so our space is a unique mark.}
-        <input>$(generate_get_drain_cmd); echo "\$@ "; awk '{a[++i]=\$0}END{while(i>0)print a[i--]}#tac' "$HSTF"</input>
+        <input>${GET_DRAIN_COMMAND}; echo "\$@ "; awk '{a[++i]=\$0}END{while(i>0)print a[i--]}#tac' "$HSTF"</input>
         <output file>$HSTF</output>
         ${DEBUG2:+<action>echo>&2 ,,, varCMD ,,,</action>}
         <action signal="activate" condition="command_is_true(echo \${varCMD:-true})">break:</action>
-        <action signal="activate">set -- \$varCMD; echo "\$@" >> '$HSTF'; echo "\$@" >> "$TMPD/.hist-\$ID.sh"; $UNEXPORT varLIST varF3; eval "\$@" &</action>
+        <action signal="activate">set -- \$varCMD; echo "\$@" >> '$HSTF'; echo "\$@" >> "$TMPD/.hist-\$ID.sh"; $UNEXPORT $UNEXP_GUI1 $UNEXP_GUI2 $UNEXP_NOT_TAP; eval "\$@" &</action>
         <action signal="activate" condition="active_is_false(varOPEN)">exit:EXIT</action>
         <action signal="activate" condition="command_is_true(echo \$varFOCUSSEARCH)">grabfocus:varSEARCH</action>
         <action signal="activate" condition="command_is_false(echo \$varFOCUSSEARCH)">grabfocus:varLIST</action>
         <action signal="activate">refresh:varCMD</action>
       </comboboxentry>
       ${REMARK#  ]]]}
+      ${REMARK#  [[[. History item run in terminal button.}
+      <button tooltip-text="$i18n_Run_command_in_terminal" theme-icon-size="16">
+        <input file icon="findnrun_terminal"></input>
+        <action>grabfocus:varCMD</action>
+        <action>$LOAD_INVOCATION_ENV; eval set -- \$varCMD; $SAVE_ARGS_HISTORY; $UNEXPORT $UNEXP_GUI1 $UNEXP_GUI2 $UNEXP_NOT_TAP; $EVAL_ARGS_IN_TERM</action>
+      </button>
+      ${REMARK#  ]]]}
       ${REMARK#  [[[. History item delete button.}
-      <button tooltip-text="$(gettext "Remove entry from history")" stock-icon-size="1">
+      <button tooltip-text="$i18n_Remove_entry_from_history" stock-icon-size="1">
         <input file stock="gtk-remove"></input>
         <action>grabfocus:varCMD</action>
         ${REMARK# pull-down-list ::= varLIST-item + history-file-contents.}
@@ -1328,159 +2443,41 @@ start_window << EOF
     </hbox>
     ${REMARK# ]]]}
     ${REMARK# [[[. varCOMMENT: display item comment.}
-    <entry sensitive="false" tooltip-text="$(gettext "Comment about current item")">
+    <entry sensitive="false" tooltip-text="$i18n_Comment_about_current_item">
       <variable>varCOMMENT</variable>
       <input>IFS=${SEP}; set -- \${varLIST}; echo "\$4${showcategories:+ \$5}"</input>
     </entry>
     ${REMARK# ]]]}
-    ${REMARK# [[[. Options and tools (bottom bar)}
-    <hbox space-fill="false" space-expand="false">
-      ${REMARK# [[[. EXP0 expander activates EXP1}
-      <expander expanded="false" tooltip-text="$(gettext "More...")">
-        <text visible="false"></text>
-        <variable export="false">EXP0</variable>
-        <action>if false show:EXP1</action>${REMARK# show the other expander and...}
-        <action>if false activate:EXP1</action>${REMARK# ...expand it}
-        <action>if true activate:EXP0</action>${REMARK# shrink myself and...}
-        <action>hide:EXP0</action>${REMARK# ...hide myself immediately}
-        <label>""</label>
-      </expander>
-      ${REMARK# ]]]}
-      ${REMARK# [[[. varOPEN checkbox}
-      <checkbox use-underline="true" tooltip-text="$(gettext "Keep this window open after activating an item. Keep the window open to use the history feature, or to avoid startup delays.")">
-        <label>$(gettext "_Keep window")</label>
-        <default>${defOPEN}</default>
-        <variable>varOPEN</variable>
-        ${DEBUG2:+<action>echo>&2 ,,, varOPEN ,,,</action>}
-        <action>awk -v s=defOPEN=\${varOPEN} '/^defOPEN=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-      </checkbox>
-      ${REMARK# ]]]}
-      ${REMARK# [[[. varICONS checkbox}
-      <checkbox use-underline="true" tooltip-text="$(gettext "Display all available icons instead of displaying just the icons that do not need to be cached. Caching all icons may take some time. Disabling this option clears the existing cache.")">
-        <label>$(gettext "_Show all icons")</label>
-        <default>${varICONS}</default>
-        <variable>varICONS</variable>
-        ${DEBUG2:+<action>echo>&2 ,,, varICONS ,,,</action>}
-        <action>awk -v s=varICONS=\${varICONS} '/^varICONS=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-        <action>clear:varSEARCH</action>
-        ${DEBUG2:+<action>ls /usr/share/pixmaps/findnrun-.uptodate ~/.icons/findnrun-.uptodate >&2; cat ~/.findnrunrc >&2</action>}
-        <action condition="command_is_true([ -f '${ICONSTEM}.uptodate' -a true = \${varICONS} ] && echo true)">break:</action>
-        ${DEBUG2:+<action>if true echo >&2 in true rebuilding database...</action>}
-        <action>if true gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v LIST_FILE='$LIST_FILE' > '${DATF}'</action>
-        ${DEBUG2:+<action>if true echo >&2 in true clear:varLIST</action>}
-        <action>if true clear:varLIST</action>
-        ${DEBUG2:+<action>if true echo >&2 in true refresh:varLIST</action>}
-        <action>if true refresh:varLIST</action>
-        ${DEBUG2:+<action>if false echo >&2 in false rm -f \{~/.icons\|/usr/share/pixmaps\}/findnrun-\*</action>}
-        <action>if false rm -f '${ICONSTEM:-/tmp/dummy}'*</action>
-        ${DEBUG2:+<action>if false echo >&2 in false rebuilding database...</action>}
-        <action>if false gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v LIST_FILE='$LIST_FILE' > '${DATF}'</action>
-        ${DEBUG2:+<action>if false echo >&2 in false clear:varLIST</action>}
-        <action>if false clear:varLIST</action>
-        ${DEBUG2:+<action>if false echo >&2 in false refresh:varLIST</action>}
-        <action>if false refresh:varLIST</action>
-      </checkbox>
-      ${REMARK# ]]]}
-      ${REMARK# [[[. varFOCUSSEARCH checkbox}
-      <checkbox use-underline="true" tooltip-text="$(gettext "Return the keyboard focus to the search input field after activating an item instead of keeping the keyboard focus on the activated list item.")">
-        <label>$(gettext "_Focus search")</label>
-        <default>${varFOCUSSEARCH}</default>
-        <variable>varFOCUSSEARCH</variable>
-        ${DEBUG2:+<action>echo>&2 ,,, varFOCUSSEARCH ,,,</action>}
-        <action>awk -v s=varFOCUSSEARCH=\${varFOCUSSEARCH} '/^varFOCUSSEARCH=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-      </checkbox>
-      ${REMARK# ]]]}
-      ${REMARK# This widget makes the widgets to its left float left and distribute evenly when the window is widened.}
-      <text space-fill="true" space-expand="true"><label>""</label></text>
-      ${REMARK# [[[. 'help' button}
-      <button tooltip-text="$(gettext "About and help")" stock-icon-size="1">
-        <input file stock="gtk-about"></input>
-        <action>launch:GUI_ABOUT</action>
-      </button>
-      ${REMARK# ]]]}
-      ${REMARK# [[[. 'exit' button}
-      <button tooltip-text="$(gettext "Exit")" stock-icon-size="1">
-        <input file stock="gtk-quit"></input>
-        <action>exit:EXIT</action>
-      </button>
-      ${REMARK# ]]]}
-    </hbox>
-    ${REMARK# ]]]}
-    ${REMARK# [[[. EXP1 expander shows More options}
-    <hbox>
-      <expander expanded="false" visible="false" space-fill="true" space-expand="true" label-fill="false" tooltip-text="$(gettext "Click to hide.")">
-        <hbox space-fill="false" space-expand="false">
-          ${REMARK# [[[. SHOWNODISPLAY checkbox}
-          <checkbox use-underline="true" tooltip-text="$(gettext "Show also hidden system applications.")">
-            <label>$(gettext "Show _hidden")</label>
-            <default>${SHOWNODISPLAY}</default>
-            <variable>SHOWNODISPLAY</variable>
-            ${DEBUG2:+<action>echo>&2 ,,, SHOWNODISPLAY ,,,</action>}
-            <action>awk -v s=SHOWNODISPLAY=\${SHOWNODISPLAY} '/^SHOWNODISPLAY=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-            <action>gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v LIST_FILE='$LIST_FILE' > '${DATF}'</action>
-            <action>refresh:varLIST</action>
-          </checkbox>
-          ${REMARK# ]]]}
-          ${REMARK# [[[. SEARCHCOMPLETE checkbox}
-          <checkbox use-underline="true" tooltip-text="$(gettext "Search in application names, file names, command lines, comments and categories all at once.")">
-            <label>$(gettext "Search _complete")*</label>
-            <default>${SEARCHCOMPLETE}</default>
-            <variable>SEARCHCOMPLETE</variable>
-            ${DEBUG2:+<action>echo>&2 ,,, SEARCHCOMPLETE ,,,</action>}
-            <action>awk -v s=SEARCHCOMPLETE=\${SEARCHCOMPLETE} '/^SEARCHCOMPLETE=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-            <action>: >"$RWMF"</action>
-            <action>launch:RESTART_WINDOW</action>${REMARK# restart findnrun? w/ args}
-          </checkbox>
-          ${REMARK# ]]]}
-          ${REMARK# [[[. SEARCHREGEX checkbox}
-          <checkbox use-underline="true" tooltip-text="$(gettext "Interpret the search pattern as a POSIX Basic regular expression.")">
-            <label>$(gettext "_Regex")*</label>
-            <default>${SEARCHREGEX}</default>
-            <variable>SEARCHREGEX</variable>
-            ${DEBUG2:+<action>echo>&2 ,,, SEARCHREGEX ,,,</action>}
-            <action>awk -v s=SEARCHREGEX=\${SEARCHREGEX} '/^SEARCHREGEX=/{\$0=s;f=1}{a[++n]=\$0}END{if(!f)a[++n]=s;++n;for(i=1;i!=n;i++)print a[i]>ARGV[1]}' '${CONFIG}'</action>
-            <action>: >"$RWMF"</action>
-            <action>launch:RESTART_WINDOW</action>${REMARK# restart findnrun? w/ args}
-          </checkbox>
-          ${REMARK# ]]]}
-          ${REMARK# This widget makes the widgets to its left float left and distribute evenly when the window is widened.}
-          <text space-fill="true" space-expand="true"><label>""</label></text>
-          ${REMARK# [[[. 'edit' button}
-          <button tooltip-text="$(gettext "Edit configuration file directly. Restart required for changes to take effect.*")" stock-icon-size="1">
-            <input file stock="gtk-edit"></input>
-            <action>open=$({ command -v rox || command -v xdg-open; } 2>/dev/null); \$open "$CONFIG" &</action>
-            <action>gettext -s "When you are finished making your changes come back to this window and restart findnrun." >"$RWMF"</action>
-            <action>launch:RESTART_WINDOW</action>
-          </button>
-          ${REMARK# ]]]}
-        </hbox>
-        <label>"$(gettext "application finder options       * = restart required")"</label>
-        <variable export="false">EXP1</variable>
-        <action>if false show:EXP0</action>
-        <action>if false hide:EXP1</action>
-      </expander>
-    </hbox>
-    ${REMARK# ]]]}
-    ${REMARK# [[[. Menubar (nearly hidden 1x1).}
+    ${REMARK# [[[. Hotkey Menubar (nearly hidden 1x1).}
     ${REMARK# Implementing hotkeys as key-press-event handlers would slow down typing way too much.}
     ${REMARK# So the menubar implements hotkey handlers as menu accelerators, which are fast.}
     ${REMARK# Note that menu accelerators act globally, so these hotkeys really apply to all widgets.}
     <menubar height-request="1" width-request="1">
       <menu>
-      ${REMARK#  [[[. Hotkeys for varENTRY.}
+      ${REMARK#  [[[. Hotkeys for varSEARCH.}
         ${REMARK#   [[[. Keys PageUp/PageDown paginate the current source plugin tap.}
         ${REMARK# Note that we serialize (%s) the event name to ensure invokeTAP detects a change.}
-        <menuitem accel-key="0xff55" accel-mods="0">
+        <menuitem label="$i18n_previous_results_page" accel-key="0xff55" accel-mods="0">
           <action>date '+PageUp %s'>"${ETAP}"</action>
         </menuitem>
-        <menuitem accel-key="0xff56" accel-mods="0">
+        <menuitem label="$i18n_next_results_page" accel-key="0xff56" accel-mods="0">
           <action>date '+PageDown %s'>"${ETAP}"</action>
         </menuitem>
         ${REMARK#   ]]]}
-        ${REMARK#   [[[. Key F12 activates the top varLIST item.}
-        <menuitem accel-key="${HOTKEY_F12##*:}" accel-mods="${HOTKEY_F12%%:*}">
+        ${REMARK#   [[[. Key F5 start item in terminal.}
+        <menuitem label="$i18n_run_top_selected_result_in_terminal" accel-key="${HOTKEY_F5##*:}" accel-mods="${HOTKEY_F5%%:*}">
           <action>grabfocus:varLIST</action>
-          <action>$(generate_invoke_source_drain)</action>${REMARK# which saves item to history.}
+          <action>${INVOKE_SOURCE_DRAIN_TERM}</action>${REMARK# which saves item to history.}
+          <action condition="active_is_false(varOPEN)">exit:EXIT</action>
+          <action condition="command_is_true(echo \${varFOCUSSEARCH})">grabfocus:varSEARCH</action>
+          <action condition="command_is_false(echo \${varFOCUSSEARCH})">grabfocus:varLIST</action>
+        </menuitem>
+        ${REMARK#   ]]]}
+        ${REMARK#   [[[. Key F12 activates the top varLIST item.}
+        <menuitem label="$i18n_run_top_selected_result" accel-key="${HOTKEY_F12##*:}" accel-mods="${HOTKEY_F12%%:*}">
+          <action>grabfocus:varLIST</action>
+          <action>${INVOKE_SOURCE_DRAIN}</action>${REMARK# which saves item to history.}
+          <action condition="active_is_false(varOPEN)">exit:EXIT</action>
           <action condition="command_is_true(echo \${varFOCUSSEARCH})">grabfocus:varSEARCH</action>
           <action condition="command_is_false(echo \${varFOCUSSEARCH})">grabfocus:varLIST</action>
         </menuitem>
@@ -1488,135 +2485,295 @@ start_window << EOF
       ${REMARK#  ]]]}
       ${REMARK#  [[[. Hotkeys for varLIST.}
         ${REMARK#   [[[. Key F4 saves search results and invokes a filter.}
-        <menuitem accel-key="${HOTKEY_F4##*:}" accel-mods="${HOTKEY_F4%%:*}">
+        <menuitem label="$i18n_save_search_results" accel-key="${HOTKEY_F4##*:}" accel-mods="${HOTKEY_F4%%:*}">
           <action>save:varLIST</action>
-          <action>$(generate_invoke_source_save_filter)</action>
+          <action>${INVOKE_SOURCE_SAVE_FILTER}</action>
         </menuitem>
         ${REMARK#   ]]]}
       ${REMARK#  ]]]}
       ${REMARK#  [[[. Hotkeys for the main window widget.}
         ${REMARK#   [[[. Key ESC terminates findnrun.}
-        <menuitem accel-key="0xff1b" accel-mods="0">
+        <menuitem label="$i18n_quit" accel-key="0xff1b" accel-mods="0">
           <action>exit:EXIT</action>
         </menuitem>
         ${REMARK#   ]]]}
         ${REMARK#   [[[. Key F1 invokes the help viewer.}
-        <menuitem accel-key="0xffbe" accel-mods="0">
-          <action>${helpviewer:-:} "\${PLGDIR:-...}/index.md" &</action>
+        <menuitem label="$i18n_show_help" accel-key="0xffbe" accel-mods="0">
+          <action>refresh:PLGDIR</action>
+          <action>${HELPVIEWER:-:} "\$HELPINDEX" "\${PLGDIR:-...}/index.md" &</action>
         </menuitem>
         ${REMARK#   ]]]}
         ${REMARK#   [[[. Key F2 cycles focus between the search and the command entry field.}
-        <menuitem accel-key="${HOTKEY_F2##*:}" accel-mods="${HOTKEY_F2%%:*}">
+        <menuitem label="$i18n_cycle_through_input_fields" accel-key="${HOTKEY_F2##*:}" accel-mods="${HOTKEY_F2%%:*}">
           <action>case \${varF2:-false} in true) echo false;; false) echo true;; esac >"${F2SF}"</action>
           <action>refresh:varF2</action>
         </menuitem>
         ${REMARK#   ]]]}
         ${REMARK#   [[[. Key F3 cycles the list view among built-in and plugin sources.}
-        <menuitem accel-key="${HOTKEY_F3##*:}" accel-mods="${HOTKEY_F3%%:*}">
-          <action>set -- $VISIBLE_SOURCES; echo -n \$(((\${varF3} + 1) % \${#}))>'${F3SF}'</action>
+        <menuitem label="$i18n_cycle_through_search_sources" accel-key="${HOTKEY_F3##*:}" accel-mods="${HOTKEY_F3%%:*}">
+          <action>$SELECT_NEXT_SOURCE</action>
           <action>refresh:varF3</action>
+        </menuitem>
+        ${REMARK#   ]]]}
+        ${REMARK#   [[[. Key F6 clears the search input field.}
+        <menuitem label="$i18n_clear_search_input" accel-key="${HOTKEY_F6##*:}" accel-mods="${HOTKEY_F6%%:*}">
+          <action>enable:varF6</action>
         </menuitem>
         ${REMARK#   ]]]}
       ${REMARK#  ]]]}
       ${REMARK#  [[[. Keys Ctrl+1 through Ctrl+9 select the first 9 source plugins directly.}
-        $(generate_source_hotkeys)
+        ${SOURCE_HOTKEYS}
       ${REMARK#  ]]]}
+      ${REMARK#   [[[. Hotkeys for DEBUG mode.}
+      ${DEBUG1:+`printf '<menuitem label="[DEBUG] show selected item info" accel-key="0x069" accel-mods="4">'`}
+      ${DEBUG1:+`printf '<action>IFS="\b"; set -- \$varLIST; i=0; for p; do [ $i = 0 ] && f=$p; : $((++i)); printf "\x25 4d : \x25s" $i "$p"; echo; done >&2; sed -e "s/^/   /" "$f" >&2</action>'`}
+      ${DEBUG1:+</menuitem>}
+      ${REMARK#   ]]]}
         <label>""</label>
       </menu>
     </menubar>
     ${REMARK# ]]]}
+    ${REMARK# [[[. Option Menubar and tools (bottom bar)}
+    <hbox space-fill="false" space-expand="false">
+      ${REMARK# [[[. Options Menubar (visible).}
+      <menubar>
+        <menu tooltip-text="$i18n_mnu_tt_Options       ${i18n_MenuKey}${i18n_MenuKey}">
+          <menuitem label="$i18n_Hover_for_help" sensitive="false"></menuitem>
+          <menuitem label=" $i18n_asterisk_restart_required" sensitive="false"></menuitem>
+          <menuitemseparator></menuitemseparator>
+          ${REMARK# [[[. SEARCHREGEX checkbox}
+          <menuitem checkbox="$SEARCHREGEX" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Regex $i18n_mnu_tt_Fuzzy_ignores_this">
+            <label>"$i18n_mnu_Search_Regex $i18n_asterisk"</label>
+            <variable>SEARCHREGEX</variable>
+            ${DEBUG2:+<action>echo>&2 ,,, SEARCHREGEX ,,,</action>}
+            <action>awk '$LET_NV' N=SEARCHREGEX V=\$SEARCHREGEX '$CONFIG'</action>
+            <action>$REQUEST_RESTART_WINDOW</action>
+          </menuitem>
+          ${REMARK# ]]]}
+          <menuitemseparator></menuitemseparator>
+          <menu use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Details">
+            ${REMARK# [[[. SEARCHFILENAMES checkbox}
+            <menuitem checkbox="$SEARCHFILENAMES" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Filename">
+            <label>"$i18n_mnu_Search_Filename${need_restart:+ $i18n_asterisk}"</label>
+              <variable>SEARCHFILENAMES</variable>
+              ${DEBUG2:+<action>echo>&2 ,,, SEARCHFILENAMES ,,,</action>}
+              <action>awk '$LET_NV' N=SEARCHFILENAMES V=\$SEARCHFILENAMES '$CONFIG'</action>
+              ${need_restart:+<action>$REQUEST_RESTART_WINDOW</action>}
+              <action>refresh:varLIST</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            ${REMARK# [[[. SEARCHCOMMENTS checkbox}
+            <menuitem checkbox="$SEARCHCOMMENTS" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Comment">
+              <label>"$i18n_mnu_Search_Comment${need_restart:+ $i18n_asterisk}"</label>
+              <variable>SEARCHCOMMENTS</variable>
+              <action>awk '$LET_NV' N=SEARCHCOMMENTS V=\$SEARCHCOMMENTS '$CONFIG'</action>
+              ${need_restart:+<action>$REQUEST_RESTART_WINDOW</action>}
+              <action>refresh:varLIST</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            ${REMARK# [[[. SEARCHCATEGORIES checkbox}
+            <menuitem checkbox="$SEARCHCATEGORIES" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Categories">
+              <label>"$i18n_mnu_Search_Categories${need_restart:+ $i18n_asterisk}"</label>
+              <variable>SEARCHCATEGORIES</variable>
+              ${DEBUG2:+<action>echo>&2 ,,, SEARCHCATEGORIES ,,,</action>}
+              <action>awk '$LET_NV' N=SEARCHCATEGORIES V=\$SEARCHCATEGORIES '$CONFIG'</action>
+              ${need_restart:+<action>$REQUEST_RESTART_WINDOW</action>}
+              <action>refresh:varLIST</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            <label>"$i18n_mnu_Search_Details"</label>
+          </menu>
+          <menu use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Ninja">
+            ${REMARK# [[[. SEARCHFROMLEFT checkbox}
+            <menuitem checkbox="$SEARCHFROMLEFT" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Anchor_Left">
+              <label>"$i18n_mnu_Search_Anchor_Left $i18n_asterisk"</label>
+              <variable>SEARCHFROMLEFT</variable>
+              ${DEBUG2:+<action>echo>&2 ,,, SEARCHFROMLEFT ,,,</action>}
+              <action>awk '$LET_NV' N=SEARCHFROMLEFT V=\$SEARCHFROMLEFT '$CONFIG'</action>
+              <action>$REQUEST_RESTART_WINDOW</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            ${REMARK# [[[. SHOWNODISPLAY checkbox}
+            <menuitem checkbox="$SHOWNODISPLAY" use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Hidden">
+              <label>"$i18n_mnu_Search_Hidden"</label>
+              <variable>SHOWNODISPLAY</variable>
+              ${DEBUG2:+<action>echo>&2 ,,, SHOWNODISPLAY ,,,</action>}
+              <action>awk '$LET_NV' N=SHOWNODISPLAY V=\$SHOWNODISPLAY '$CONFIG'</action>
+              <action>gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v DSKL='$DSKL' > '${DATF}'</action>
+              <action>refresh:varLIST</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            ${REMARK# [[[. varICONS checkbox}
+            <menuitem checkbox="$varICONS" use-underline="true" tooltip-text="$i18n_Display_all_available_icons">
+              <label>"$i18n_Show_all_icons"</label>
+              <variable>varICONS</variable>
+              ${DEBUG2:+<action>echo>&2 ,,, varICONS ,,,</action>}
+              <action>awk '$LET_NV' N=varICONS V=\$varICONS '$CONFIG'</action>
+              <action>clear:varSEARCH</action>
+              ${DEBUG2:+<action>ls /usr/share/pixmaps/$CACHEFILEPREFIX.uptodate ~/.icons/$CACHEFILEPREFIX.uptodate >&2; cat ~/.findnrunrc >&2</action>}
+              <action condition="command_is_true([ -f '${ICONSTEM}.uptodate' -a true = \${varICONS} ] && echo true)">break:</action>
+              ${DEBUG2:+<action>if true echo >&2 in true rebuilding database...</action>}
+              <action>if true gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v DSKL='$DSKL' > '${DATF}'</action>
+              ${DEBUG2:+<action>if true echo >&2 in true clear:varLIST</action>}
+              <action>if true clear:varLIST</action>
+              ${DEBUG2:+<action>if true echo >&2 in true refresh:varLIST</action>}
+              <action>if true refresh:varLIST</action>
+              ${DEBUG2:+<action>if false echo >&2 in false rm -f \{~/.icons\|/usr/share/pixmaps\}/$CACHEFILEPREFIX\*</action>}
+              <action>if false rm -f '${ICONSTEM:-/tmp/dummy}'*</action>
+              ${DEBUG2:+<action>if false echo >&2 in false rebuilding database...</action>}
+              <action>if false gawk -v ALL_ICONS=\${varICONS} -v SHOWNODISPLAY=\${SHOWNODISPLAY} -f '${AWKB}' -v DSKL='$DSKL' > '${DATF}'</action>
+              ${DEBUG2:+<action>if false echo >&2 in false clear:varLIST</action>}
+              <action>if false clear:varLIST</action>
+              ${DEBUG2:+<action>if false echo >&2 in false refresh:varLIST</action>}
+              <action>if false refresh:varLIST</action>
+            </menuitem>
+            ${REMARK# ]]]}
+            <label>"$i18n_mnu_Search_Ninja"</label>
+          </menu>
+          <label>"$i18n_mnu_Options"</label>
+        </menu>
+      </menubar>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. SEARCHFUZZY checkbox}
+      <checkbox use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Fuzzy">
+        <label>"$i18n_Fuzzy"</label>
+        <default>$SEARCHFUZZY</default>
+        <variable>SEARCHFUZZY</variable>
+        ${DEBUG2:+<action>echo>&2 ,,, SEARCHFUZZY ,,,</action>}
+        <action>awk '$LET_NV' N=SEARCHFUZZY V=\$SEARCHFUZZY '$CONFIG'</action>
+        <action>refresh:varLIST</action>
+      </checkbox>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. CASEDEPENDENT checkbox, built-in fuzzy ignores this, fzf does smart-casing or +i}
+      <checkbox use-underline="true" tooltip-text="$i18n_mnu_tt_Search_Case">
+        <label>"$i18n_CaseSensitive"</label>
+        <default>${CASEDEPENDENT}</default>
+        <variable>CASEDEPENDENT</variable>
+        ${DEBUG2:+<action>echo>&2 ,,, CASEDEPENDENT ,,,</action>}
+        <action>awk '$LET_NV' N=CASEDEPENDENT V=\$CASEDEPENDENT '$CONFIG'</action>
+        <action>refresh:varLIST</action>
+      </checkbox>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. varOPEN checkbox}
+      <checkbox use-underline="true" tooltip-text="$i18n_Keep_this_window_open">
+        <label>"$i18n_Keep_window"</label>
+        <default>${defOPEN}</default>
+        <variable>varOPEN</variable>
+        ${DEBUG2:+<action>echo>&2 ,,, varOPEN ,,,</action>}
+        <action>awk '$LET_NV' N=defOPEN V=\$varOPEN '$CONFIG'</action>
+      </checkbox>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. varFOCUSSEARCH checkbox}
+      <checkbox use-underline="true" tooltip-text="$i18n_Return_the_keyboard_focus">
+        <label>"$i18n_Focus_search"</label>
+        <default>${varFOCUSSEARCH}</default>
+        <variable>varFOCUSSEARCH</variable>
+        ${DEBUG2:+<action>echo>&2 ,,, varFOCUSSEARCH ,,,</action>}
+        <action>awk '$LET_NV' N=varFOCUSSEARCH V=\$varFOCUSSEARCH '$CONFIG'</action>
+      </checkbox>
+      ${REMARK# ]]]}
+      ${REMARK# This widget makes the widgets to its left float left and distribute evenly when the window is widened.}
+      <text space-fill="true" space-expand="true"><label>""</label></text>
+      ${REMARK# [[[. 'edit' button}
+      <button tooltip-text="$i18n_Edit_configuration_file $i18n_asterisk" stock-icon-size="1">
+        <input file stock="gtk-edit"></input>
+        <action>open=$({ command -v rox || command -v xdg-open; } 2>/dev/null); \$open "$CONFIG" &</action>
+        <action>$REQUEST_RESTART_WINDOW "$i18n_When_you_are_finished"</action>
+      </button>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. 'help' button}
+      <button tooltip-text="$i18n_About_and_help" stock-icon-size="1">
+        <input file stock="gtk-about"></input>
+        <action>launch:GUI_ABOUT</action>
+      </button>
+      ${REMARK# ]]]}
+      ${REMARK# [[[. 'exit' button}
+      <button tooltip-text="$i18n_Exit" stock-icon-size="1">
+        <input file stock="gtk-quit"></input>
+        <action>exit:EXIT</action>
+      </button>
+      ${REMARK# ]]]}
+    </hbox>
+    ${REMARK# ]]]}
     ${REMARK# [[[. varSBAR statusbar}
-    ${REMARK# Do not vbox the status bar here; keep the vbox under the control}
-    ${REMARK# of generate_status_bar to be able to hide the status bar without}
-    ${REMARK# leaving a tiny empty strip at the bottom of the main window.}
-    $(generate_status_bar)
+    ${REMARK# set_STATUS_BAR() generates a vbox wrap for STATUS_BAR.}
+    ${STATUS_BAR}
+    ${REMARK# ]]]}
+    ${REMARK# [[[. RESTART_WINDOW1 hidden checkbox, see timer RESTART_WINDOW0 below.}
+    <checkbox visible="false">
+      <variable>RESTART_WINDOW1</variable>
+      <action>launch:RESTART_WINDOW</action>
+    </checkbox>
     ${REMARK# ]]]}
   </vbox>
   ${REMARK# Do not vbox/hbox hidden widgets because boxes add some unnecessary (tiny) padding.}
   ${REMARK# Keeping hidden items after visible ones prevents issues when resizing window vertically.}
   ${REMARK# [[[. Timers (hidden).}
+  ${REMARK#  [[[. RESTART_WINDOW0: serve REQUEST_RESTART_WINDOW.}
+  ${REMARK# gtkdialog launch function limitations: see /usr/share/doc/gtkdialog/examples/miscellaneous/presentwindow.}
+  ${REMARK# e.g., if a radiobutton/checkbox menuitem launches a window other menuitems will not receive their "toggled" signal, etc. So we use a timer to watch for the launch request, and a checkbox to perform the launch. The checkbox can be hidden but apparently it must to be placed inside a visible vbox or it will not react.}
+  <timer interval="3600" visible="false" file-monitor="true">
+    <variable export="false">RESTART_WINDOW0</variable>
+    <input file>$RWMF-trigger</input>
+    <action signal="file-changed">activate:RESTART_WINDOW1</action>
+  </timer>
+  ${REMARK# -  ]]]}
   ${REMARK#  [[[. varSEARCH0: refresh initial search input.}
   <timer milliseconds="true" interval="100" visible="false">
     <variable export="false">varSEARCH0</variable>
     <action>refresh:varSEARCH</action>
+    <action>${REFRESH_SOURCE_VARS_FOR_INPUT_FILE}</action>
     ${REMARK# varF3 re-enables this timer when another plugin gets loaded.}
     <action>disable:varSEARCH0</action>
   </timer>
   ${REMARK# -  ]]]}
   ${REMARK# - ]]]}
-  ${REMARK# [[[. Cached source declaration variables (hidden).}
+  ${REMARK# [[[. Source declaration variables (hidden) see set_REFRESH_SOURCE_VARS_FOR_INPUT_FILE.}
+  ${REMARK# An action outside these VARNAME entries must refresh:VARNAME to use its value, e.g. PLGDIR for F1.}
   <entry visible="false" sensitive="false">
     <variable>TAP</variable>
     <default>${TAP}</default>
-    ${REMARK# Cache TAP until next refresh:TAP.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${TAP}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE TAP [\$varF3] \$TAP</action>}
+    <input file>${SVAR}TAP</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>DRAIN</variable>
-    <default>${DRAIN:-null}</default>
-    ${REMARK# Cache DRAIN until next refresh:DRAIN.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${DRAIN}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE DRAIN [\$varF3] \$DRAIN</action>}
+    <input file>${SVAR}DRAIN</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>ICON</variable>
-    <default>${ICON:-null}</default>
-    ${REMARK# Cache ICON until next refresh:ICON.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${ICON}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE ICON [\$varF3] \$ICON</action>}
+    <input file>${SVAR}ICON</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>TITLE</variable>
-    <default>${TITLE:-null}</default>
-    ${REMARK# Cache TITLE until next refresh:TITLE.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${TITLE}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE TITLE [\$varF3] \$TITLE</action>}
+    <input file>${SVAR}TITLE</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>SOURCE</variable>
-    <default>${SOURCE}</default>
-    ${REMARK# Cache SOURCE until next refresh:SOURCE}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${SOURCE}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE SOURCE [\$varF3] \$SOURCE</action>}
+    <input file>${SVAR}SOURCE</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>ID</variable>
-    <default>${ID}</default>
-    ${REMARK# Cache ID until next refresh:ID.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${ID}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE ID [\$varF3] \$ID</action>}
+    <input file>${SVAR}ID</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>NSOURCES</variable>
-    <default>${NSOURCES}</default>
-    ${REMARK# Cache NSOURCES until next refresh:NSOURCES.}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${NSOURCES}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE NSOURCES [\$varF3] \$NSOURCES</action>}
+    <input file>${SVAR}NSOURCES</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>INITSEARCH</variable>
-    ${REMARK# Cache INITSEARCH until next refresh:INITSEARCH}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${INITSEARCH}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE INITSEARCH [\$varF3] \$INITSEARCH</action>}
+    <input file>${SVAR}INITSEARCH</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>MODE</variable>
-    ${REMARK# Cache MODE until next refresh:MODE}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${MODE}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE MODE [\$varF3] \$MODE</action>}
+    <input file>${SVAR}MODE</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>PLGDIR</variable>
-    ${REMARK# Cache PLGDIR until next refresh:PLGDIR}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${PLGDIR}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE PLGDIR [\$varF3] \$PLGDIR</action>}
+    <input file>${SVAR}PLGDIR</input>
   </entry>
   <entry visible="false" sensitive="false">
     <variable>SAVEFLT</variable>
-    ${REMARK# Cache SAVEFLT until next refresh:SAVEFLT}
-    <input>. "${SRCSTEM}\${varF3:-0}-"*.sh && echo "\${SAVEFLT}"</input>
-    ${DEBUG2:+<action>echo>&2 === CACHE SAVEFLT [\$varF3] \$SAVEFLT</action>}
+    <input file>${SVAR}SAVEFLT</input>
   </entry>
   ${REMARK# ]]]}
   ${REMARK# [[[. Read-only values (hidden).}
@@ -1658,10 +2815,10 @@ start_window << EOF
   ${REMARK# ]]]}
   ${REMARK# [[[. Hotkey targets (hidden).}
   ${REMARK#  [[[. refresh:varF2 to cycle focus between the search field and the command entry field.}
-  ${REMARK# Key F2 demonstrates how.}
+  ${REMARK# Used by key F2.}
   <checkbox visible="false">
     <default>false</default>
-    <label>F2</label>
+    <label>"F2"</label>
     <variable>varF2</variable>
     <input file>${F2SF}</input>
     ${DEBUG2:+<action>echo>&2 ,,, varF2 ,,,</action>}
@@ -1670,34 +2827,23 @@ start_window << EOF
   </checkbox>
   ${REMARK#  ]]]}
   ${REMARK#  [[[. refresh:varF3 to switch the list view to another source.}
-  ${REMARK# Key F3 demonstrates how.}
+  ${REMARK# Used by key F3.}
   <entry visible="false" sensitive="false">
     <variable>varF3</variable>
     <default>0</default>
     <input file>${F3SF}</input>
     ${DEBUG2:+<action>echo>&2 ,,, varF3 ,,,</action>}
-    ${REMARK# [[[. Optimization: Cache current source values.}
-    <action>refresh:TAP</action>
-    <action>refresh:DRAIN</action>
-    <action>refresh:ICON</action>
-    <action>refresh:TITLE</action>
-    <action>refresh:INITSEARCH</action>
-    <action>refresh:MODE</action>
-    <action>refresh:PLGDIR</action>
-    <action>refresh:SAVEFLT</action>
-    <action>refresh:SOURCE</action>
-    <action>refresh:ID</action>
-    ${REMARK# ]]]}
     ${DEBUG2:+<action>echo>&2 ,,, refresh varSBAR [[</action>}
     <action>refresh:varSBAR</action>
     ${DEBUG2:+<action>echo>&2 ]] ,,,</action>}
     <action>clear:varSEARCH</action>
+    ${REMARK# Run code associated with timer varSEARCH0.}
     <action>enable:varSEARCH0</action>
     <action>refresh:varLIST</action>
   </entry>
   ${REMARK#  ]]]}
   ${REMARK#  [[[. Write event name to file $ETAP to invoke the current tap.}
-  ${REMARK# Keys PageDown/PageUp demonstrate how.}
+  ${REMARK# Used by keys PageDown/PageUp.}
   <entry visible="false" auto-refresh="true">
     <default>Search</default>
     <variable>invokeTAP</variable>
@@ -1709,6 +2855,17 @@ start_window << EOF
     <action>clear:invokeTAP</action>${COMMENT# Clear cached value.}
   </entry>
   ${REMARK#  ]]]}
+  ${REMARK#  [[[. enable:varF6 to clear the search entry field.}
+  ${REMARK# Used by key F6.}
+  <timer milliseconds="true" interval="100" visible="false">
+    <sensitive>false</sensitive>
+    <variable export="false">varF6</variable>
+    ${DEBUG2:+<action>echo>&2 ,,, varF6 ,,,</action>}
+    <action>disable:varF6</action>
+    <action>grabfocus:varSEARCH</action>
+    <action>clear:varSEARCH</action>
+  </timer>
+  ${REMARK#  ]]]}
   ${REMARK# ]]]}
   ${REMARK# [[[. Hotkey actions (hidden).}
   ${REMARK# DEBUG <action signal="key-press-event">exec 1>&2;echo;date;env|grep KEY_</action>}
@@ -1716,11 +2873,11 @@ start_window << EOF
   <action signal="delete-event">exit:abort</action>
   <variable export="false">MAINWINDOW</variable>
 </window>
-EOF
+GTKDIALOGDOC
 
 # i18n Findnrun own .desktop file. [[[1
 # i18n Translate the Name[xx] field to be added to file findnrun.desktop
-Name=$(gettext "Findnrun.")
+Name=$i18n_Name_desktop
 # i18n Translate the Comment[xx] field to be added to file findnrun.desktop
-Comment=$(gettext "Find applications and much more.")
+Comment=$i18n_Comment_desktop
 

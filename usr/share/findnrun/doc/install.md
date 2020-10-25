@@ -1,4 +1,4 @@
-_Next: [Starting Findnrun](running.md)_
+_Next: [Fzf Search Engine](fzf.md)_
 
 ## Installing
 
@@ -10,11 +10,10 @@ distribution, which is split into multiple sub-packages:
  * The optional _NLS_ package adds run-time translations in several
    languages
 
-[Installation requirements](install-require.md):
-ash (or bash[1]), gawk, gtk-dialog.
+[Installation requirements](install-require.md).
 
-[1] if you only have bash on your system, you may need to do a one-time,
-   post-install file edit. See the above link for details.
+To improve search features, accuracy and speed consider also installing the
+_[fzf search engine](fzf.md)_ package (highly recommended).
 
 To read _translated_ help files the _mdview_ markdown viewer is
 required.  While a text editor is sufficient to read English help files,
@@ -29,9 +28,11 @@ Packages for various distributions can be downloaded from:
 (1) the latest release announcement in the
 [releases page](http://github.com/step-/find-n-run/releases/):
 
- * Fatdog64 [.txz](http://github.com/step-/find-n-run/releases/)
- * Puppy Linux [.pet](http://github.com/step-/find-n-run/releases/)
- * Debian (Lubuntu) [.deb](https://github.com/step-/find-n-run/releases/tag/1.10.6)
+* Fatdog64 [.txz](http://github.com/step-/find-n-run/releases/)
+* Puppy Linux [.pet](http://github.com/step-/find-n-run/releases/)
+* Debian/Ubuntu/Mint - .deb packages aren't available, but you should be able
+  to install findnrun following the
+  [Debian page](https://github.com/step-/find-n-run/blob/master/usr/share/findnrun/doc/DEBIAN.md).
 
 (2) one of these known threads:
 
@@ -59,5 +60,5 @@ and
 Some plugins may require you to install a separate NLS support package
 before they can display translated messages.
 
-_Next: [Starting Findnrun](running.md)_
+_Next: [Fzf Search Engine](fzf.md)_
 

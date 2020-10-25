@@ -2,7 +2,7 @@
 
 **Findrun** - A progressive finder
 
-_2.4.0_
+_4.0.3_
 
 [Project home](http://github.com/step-/find-n-run)
    | [Downloads](http://github.com/step-/find-n-run/releases)
@@ -35,6 +35,7 @@ Both projects name the main script 'findnrun'.
 ## Main features
 
  * **Fast incremental search** (find as you type)[1]
+ * **Exact and fuzzy matching** (choice of "built-in" or external ["fzf"](fzf.md) engines)
  * **Search Plugins** extend search to other data types
  * **Command line entry** with history.
  * **[Hotkeys](hotkey.md)**
@@ -63,6 +64,7 @@ Both projects name the main script 'findnrun'.
 
  * [Screenshots](screenshots.md)
  * [Installing](install.md) and Language Settings
+ * [Fzf](fzf.md) Search Engine
  * [Starting](running.md) Findnrun
  * [Configuring](preference.md) Preferences
  * [Hotkeys](hotkey.md)

@@ -109,9 +109,9 @@ initialization files.
 
     env GEOMETRY=500x200+100+100 findnrun
 
-`XCLIP`
+`RDR`
 
-  Advanced setting for the save filter function. See XCLIP in [user preferences](preference.md).
+  Advanced setting for the save filter function. See RDR in [user preferences](preference.md).
 
 `FNRDEBUG`
 
@@ -126,4 +126,15 @@ initialization files.
 
   See more examples in the [translation tutorial](TRANSLATING.md).
 
+`FNRSEARCHENGINE`
+
+  See section _[Fzf Search Engine](fzf.md)_ for details.
+  To use the older, built-in search engine set this variable to value "v1":
+
+    env FNRSEARCHENGINE=v1 findnrun
+  
+  Or set it in your [configuration file](preference.md), which takes precedence
+  over the environment value.
+
 _Next: [Configuring Preferences](preference.md)_
+

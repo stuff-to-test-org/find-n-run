@@ -50,13 +50,14 @@ Findnrun provides plugins with:
  * a _call interface_ for a plugin to request execution of findnrun
    functions
  * a set of _services_
+ * a set of _helper functions_
 
 Plugins provide findnrun with new search types/methods, and optional
 user interface elements.
 
 ### Source Plugins
 
-A source plugin comprises a _tap_, an optional _drain_. The tap outputs
+A source plugin comprises a _tap_ and an optional _drain_. The tap outputs
 the data records that populate the list widget. The drain consumes the
 selected record when the user presses ENTER or double-clicks the list
 view selection.
@@ -68,14 +69,14 @@ A tap-record consists of fields separated by the pipe character '|':
     <icon-reference> '|' <tap-reserved> '|' <label> '|' <tap-data> '|' <comment> '|' <categories>
 ````
 
-All fields yield string values, all characters allowed (caveat) except
-the pipe character. There is no way to include a literal pipe character
-in a value.  All values can be null except for `<tap-data>`.
+All fields hold string values, which can include any character except '|'.
+Caveat: no value can include a literal pipe character.
+All values can be null except for `<tap-data>`.
 
  * `<icon-reference>` is an icon _reference_. See section _Findnrun User
    Interface and Source Plugins_.
  * `<tap-reserved>` is available for a plugin to associate special data
-   to the tap-record record for custom activation. Currently this field
+   to the tap-record for custom activation. Currently this field
    isn't processed or further exposed in the plugin interface awaiting
    feedback from plugin developers.
  * `<label>` is displayed in the list widget. If the label value is null
@@ -91,14 +92,26 @@ in a value.  All values can be null except for `<tap-data>`.
     american_icon||born to run|mplayer /root/bruce.mp3|the boss|multimedia;audio
     |command line||xterm -e sh||system
     |||chrome
+
+The last example shows the minimum data a well-formed record must
+include. Accordingly, findnrun's list view displays a predefined icon,
+label "chrome" and tap-data "chrome". To show an empty icon, pass the file
+name of an empty image. To show an empty label pass a space character (" ").
+
+**Whole line records**
+
+Findnrun can accept whole lines that contain no "|" as well-formed records.
+The requirement is for your plugin to filter its output through
+`findnrun-formatter -- -O s`. See section '_Formatter_' for details.
+This feature simplifies using the output of common Linux text utilites to
+create tap-records.
+
+So for a line consisting solely of one (or more words), e.g.
+
     firefox
 
-The last example is the minimum data a well-formed record must
-include. Accordingly, findnrun's list view shows a predefined icon,
-label "firefox" and tap-data "firefox". Similarly, for record
-`|||chrome` the list view shows a predefined icon, title "chrome" and
-tap-data "chrome". To show an empty icon, set the filename of an empty
-image. To show an empty label set a space character (" ").
+findnrun's list view will display a predefined icon, label "firefox"
+and tap-data "firefox".
 
 ### Declaring Source Plugins
 
@@ -111,35 +124,57 @@ In the following discussion:
 A source plugin is installed by adding its declaration into
 `.findnrunrc` as follows:
 ```
-    SOURCE_<source-id>='<tap-id>:<drain-id>:<icon-id>:<title-id>:<init-search-id>'
-    TAP_<tap-id>='<tap-command>'
-    DRAIN_<drain-id>='<drain-command>'          # optional
-    ICON_<icon-id>='<icon-filepath>'            # optional
+    SOURCE_<source-id>='<tap-id>:<drain-id>:<icon-id>:<title-id>:<init-search-id>:<mode-id>:<plgdir-id>:<saveflt-id>:<init-id>'
+    TAP_<tap-id>='<tap-command>'                # code
+    DRAIN_<drain-id>='<drain-command>'          # optional, code
+    ICON_<icon-id>='<icon-name-or-filepath>'    # optional
     TITLE_<title-id>='<source-title>'           # optional
     INITSEARCH_<init-search-id>='<init-search>' # optional
     MODE_<mode-id>='<mode-mask>'                # optional
     PLGDIR_<plgdir-id>='<plugin-dir-path>'      # optional
-    SAVEFLT_<filter-id>='<save-filter-command>' # optional
+    SAVEFLT_<filter-id>='<save-filter-command>' # optional, code
+    INIT_<init-id>='<init-command>              # optional, code
 ```
 
+ * Declarations marked 'code' are expected to contain shell source code
+   fragments of the kind that shell's `eval` can interpret.
+ * Declarations marked "optional" can be omitted by leaving their respective
+   `<...-id>` slot empty in the `SOURCE_<source-id>` declaration.[1]
  * Each `<...-id>` identifier must be unique within its declaration
-   group (SOURCE\_, TAP\_, DRAIN\_, ICON\_, TITLE\_, INITSEARCH\_).
- * `<tap-command>` is a valid shell command.
- * `<drain-command>` is also a valid shell command.
- * `<icon-filepath>` is the full path to a supported icon image file.
+   group (SOURCE\_, TAP\_, DRAIN\_, ICON\_, TITLE\_, INITSEARCH\_, MODE\_,
+   PLGDIR\_, SAVEFLT\_, INIT\_).
+ * Given a declaration `SOURCE_<source-id>`, the other <...-id>`s in the
+   declaration may be the same word, which can be `<source_id>`. In fact, this
+   is the most common case, e.g.,
+
+    SOURCE_My=My:My:My:My:My:My:My:My:My
+    TAP_My=...
+    DRAIN_My=...
+    ...
+    INIT_My=...
+
+ * `<tap-command>` is any valid shell command.
+ * `<drain-command>` is any valid shell command.
+ * `<icon-name-or-filepath>` is a GTK icon name[2] or the full path to a supported icon image file.
  * `<source-title>` is displayed in the user interface.
  * `<init-search>` can be used to initialize the search input field.
- * `<mode-mask>` is a bit mask of plugin modifiers, for instance "disabled".
+ * `<mode-mask>` is a bit mask of plugin modifiers, e.g. "disabled".
  * `<plugin-dir-path>` is the location of the plugin resource files, if any.
- * `<save-filter-command>` is a valid shell command.
- * Declarations marked "optional" can be omitted by leaving their
-   respective `<...-id>` slot empty in the `SOURCE_<source-id>`
-   declaration.
+ * `<save-filter-command>` is any valid shell command.
+ * `<init-command>` is any valid shell command.
  * Embedded newline or carriage return characters are not allowed in
    `<...-command>` values.
- * All values are quoted strings. Paired exterior double quotes work
-   just as well as single quotes, but require escaping interior shell
+ * All values are quoted strings. Paired exterior double quotes work just as
+   well as single quotes, but require escaping interior double quotes and shell
    special characters.
+
+[1] A common pitfall is declaring, say, `INIT_My="command"` but forgetting to
+   insert `INIT_My` in its correct slot of `SOURCE_My`.  If you do so,
+   the declaration of `INIT_My` will be ignored.
+
+[2] An icon name refers to an existing icon file in the current GTK user theme
+   or fallback theme (hicolor), or is a GTK stock icon name. If none of these
+   conditions is met you must declare the full path to the icon file.
 
 You can use any valid shell variable name as an `<...-id>`, but
 prefix "FNR" is reserved for findnrun's own plugins.
@@ -178,7 +213,7 @@ values:
     0x2  HIDDEN    Plugin is installed/validated/allocated but invisible *NOT IMPLEMENTED*
 ```
 
-**Example of disabled plugin**
+**Disabling a plugin**
 ```
     # tap:drain:default_icon:title:search_term:mode_bit_mask
     SOURCE_find_file='find_file:filer_select:find_file:find_file::disabled'
@@ -192,11 +227,20 @@ Each tap-, drain- and save-filter-command is implemented as a shell
 command, script, or external program, something that the shell can
 execute.
 
+Some _helper functions_ are available for use in shell commands.
+
 ### Plugin Invocation
 
-Findnrun _invokes_ three kinds of commands. While the user is typing
-into the search innput field, findnrun invokes the tap-command as
-follows:
+Findnrun _invokes_ four kinds of commands. When a source is first
+invoked at program start, the init-command is invoked as follows:
+```
+    eval <init-command>
+```
+This is where a plugin can do all sorts of private initializations. The
+init-command is invoked once only.
+
+While the user is typing into the search innput field, findnrun invokes the
+tap-command as follows:
 ```
     eval <tap-command>
 ```
@@ -204,63 +248,73 @@ The tap-command can use the current value of the search input field by
 including the string `${term}` in `<tap-command>`.  On each plugin
 invocation the tap may output zero or more formatted tap-records.
 
+A tap-command can use the following pre-defined helper functions:
+* `FNRset_TMPD_DATF`
+* `FNRsearch`
+
+See section _Helper Functions_.
+
 When the user selects and activates an entry in the list view, findnrun
 invokes the drain-command as follows:
 ```
-    eval <drain-command> <tap-data>
+    eval set -- <drain-command> <tap-data>; ...; "$@" &
 ```
 
-Just before starting the command findnrun saves the invocation command,
-without "eval ", into the history list pull-down widget.[1]
+Just before starting the command with `"$@"` findnrun saves it
+into the history list pull-down widget.[1]
 If the drain-command value is null findnrun starts `<tap-data>` with the
 shell builtin command `eval`.
 
-[1] Findnrun's _history service_ also saves two other history files: the
-global history file and the plugin's history file. Currently these files
-are not exposed in the user interface, and the pull-down widget shows
-the global history. This might change in the future.
+Caveat: Invocation fails with a syntax error if drain-command is other than a
+simple shell command (script or binary path, built-in shell command) or null.
 
-When the user presses hotkey `F4` findnrun saves the search results to a
+[1] Findnrun's _history service_ also saves two other history files: the
+   global history file and the plugin's history file. Currently these files
+   are not exposed in the user interface, and the pull-down widget shows
+   the global history. This might change in the future.
+
+When the user presses hotkey `F4` findnrun saves the raw search results to a
 file and invokes save-filter-command as follows:
 ```
     eval <save-filter-command>
-
-Then save-filter-command can process the file to its own liking. The
-command string can use `${file}` to refer to the input save file, and
-`$FNRSAVEFLT` to leverage the save filter code that built-in sources
-run.
+```
 
 ### Invocation Environment
 
-The _invocation environment_ provides tap-, drain- and save-filter-
+The _invocation environment_ provides tap-, drain, save-filter- and init-
 commands with the following preset variables:
 
- * `${SOURCE}`, `${TAP}`, `${DRAIN}`, `${TITLE}`, `${ICON}`,
-   `${INITSEARCH}`, `${MODE}` - from the source declaration
+ * `${SOURCE}`, `${TAP}`, `${DRAIN}`, `${ICON}`, `${TITLE}`, `${INITSEARCH}`,
+   `${MODE}`, `${PLGDIR}`, `${SAVEFLT}` and `${INIT}` - from the source
+   declaration
  * `${ID}` - the source-id
- * `${NSOURCES} - number of sources
+ * `${NSOURCES}` - number of sources
+ * `${THISFILE}` - the shell file that sets all of the above variables.
+
+ * `${FNRFZF}` - full path of `fzf`, null if `fzf` isn't installed
+ * `${FNRSEARCHENGINE}` - requested search engine: "fzf" or "v1"
  * `${FNRPID}` - findnrun gtkdialog process id [1]
  * `${FNRTMP}` - findnrun temporary folder full path [2]
  * `${FNREVENT}` - invocation event name [3]
  * `${FNRRPC}` - call interface mailbox file, see section _Remote Call Interface_
  * `${FNRDEBUG}` - findnrun debugging level 1-9.
 
-For save-filter-command only there are also these variable that can be
-leveraged to create custom save filters:
+For save-filter-command these additional variables can be used:
 
- * `${FNRSAVEFLT}` - save-filter code for built-in sources[4]
- * `${FNRXCLIP}` - XCLIP redirection for built-in sources.
+ * `${FNRSAVEFLT}` - predefined save-filter code used by built-in sources[4]
 
 [1] Value is `NA` if gtkdialog isn't running.
 
 [2] Findnrun's own temporary folder persists across plugin command
    invocations.  It is automatically deleted when findnrun terminates.
    Plugins are required to store their resource files in a fixed
-   sub-folder of `${FNRTMP}`. Specifically, the shell initialization
-   stanza of a plugin resource folder named `${TMPD}` is:
+   sub-folder of `${FNRTMP}`. Specifically, a plugin could initialize
+   its temporary folder named `${TMPD}` with:
 ```
     TMPD="${FNRTMP:-/tmp}/.${ID}" && mkdir -p "${TMPD}" && chmod 700 "${TMPD}"
 ```
+  The above code is conveniently pre-defined as a helper function.
+  See section _Helper Functions_.
 
 [3] Name of the event that led to the invocation of a tap or
    drain. Currently the following names are defined:
@@ -275,8 +329,7 @@ leveraged to create custom save filters:
  * **Activate** - Drain - Enter key pressed or mouse left-clicked when a
    search result list item has the focus.
 
-[4] The calling convention for `${FNRSAVEFLT}` is unusual. Look up the
-   definitions of `SAVEFLT_FNRstart` and `SAVEFLT_filmstrip` for examples.
+[4] See section _Saving Search Results_.
 
 ### Findnrun User Interface and Source Plugins
 
@@ -321,7 +374,7 @@ SVG files, are recommended whenever possible.
 
 **Icon References**
 
-Simply put, an _icon reference_ is a icon file path that is formatted
+Simply put, an _icon reference_ is an icon file path that is formatted
 in a way and located in a place where gtkdialog knows how to use
 it. Gtkdialog follows freedesktop.org's rules for enumerating
 icons. Icon files must be placed in specific directories, the details
@@ -412,6 +465,32 @@ Recognized calls:
  * `PageUp` - Paginate up, cf. _Paginating Search Results_
  * `PageDown` - Paginate down
 
+### Saving Search Results
+
+When the user presses hotkey `F4` findnrun saves the raw search results to a
+file and invokes save-filter-command. Built-in sources use a predefined
+save-filter-command, which is exported to the SAVEFLT invocation environment as
+`${FNRSAVEFLT}`. Your plugin can use it or define a custom save filter
+altogether.
+
+FNRSAVEFLT's behavior can be tuned via environment variables `CUT` and `RDR`,
+which can be set also in file [~/.findnrunrc](preference.md). `CUT` selects
+which columns to save, and `RDR` defines where to save them (a filepath or a
+command pipe).
+
+For details please read the FNRSAVEFLT source code in the findnrun script file,
+and look at the definitions of `SAVEFLT_FNRstart`, `SAVEFLT_FNRsc` and
+`SAVEFLT_filmstrip` for inspiration.
+
+When FNRSAVEFLT is used:
+
+* Findnrun displays a confirmation dialog when the data is saved to a filepath.
+* The filepath must exist (except its last component, the filename, which may not).
+
+When a custom save filter is used:
+
+* it can get input data by reading file `${file}`.
+
 ### Findnrun Termination and Plugins
 
 When findnrun terminates it deletes its temporary folder and all
@@ -457,13 +536,61 @@ tap-command stanza is:
     <command> | findnrun-formatter -- [ <formatter-options> ]
 ```
 
-If tap-command outputs single records, that is, the records don't
-include "|" (pipe), then do include option `-O s`, which tells the
-formatter not to decode each tap-record in detail.
+If tap-command outputs whole line records that don't include "|" (pipe),
+then the plugin must pass option `-O s`, which tells the formatter not to
+parse each line in detail, and makes it run faster.
 
 Run `findnrun-formatter -- -h` for usage information. Note again the
 double dashes in the formatter command line: they are required before
 any other options.
+
+### Helper Functions
+
+Commands (column names) can call the following helpers (row names):
+
+    |                  | TAP | DRAIN | SAVEFLT | INIT |
+    | FNRset_TMPD_DATF | *   |       | *       | *    |
+    | FNRsearch        | *   |       |         |      |
+
+**FNRset\_TMPD\_DATF [<source\_id>]**
+
+This function sets global variables `TMPD` and `DATF`, and creates temporary
+directory `$TMPD/.<source_id>`. If `<source_id>` is null `$ID` is substituted
+in its place. The plugin can save its temporary files in `$TMPD`:
+```
+    set_TMPD_DATF; ! [ "$term" ] && tap_data > "$TMPD"/data
+```
+
+The example assumes that `tap_data` is a function that outputs tap records
+prior to performing a search for `${term}`. The search could be written as:
+```
+    grep "${term:-.}" < "$TMPD"/data | findnrun-formatter -O s
+```
+
+which completes the tap-command definition.
+
+Note that `! [ "$term" ] && tap_data` calls `tap_data` only when the search
+input field is empty, therefore not while the user is typing characters.
+This is done to speed up searching by avoiding to generate the same input
+tap-records again and again.
+If tap-records never change it would even be better to call `tap_data` just
+once from the plugin's init-command.
+
+**FNRsearch**
+
+A tap-command can call the built-in search engine that powers the
+_Application Finder_. `FNRsearch` expects input variable `DATF` to hold the
+full path of the tap-record data file. The tap-command can set DATF explicitly
+or implicitly, by calling `set_TMPD_DATF`.  Then it can start the search as:
+```
+    FNRsearch
+```
+
+The following complete example implements a tap-command that can perform
+regular and fuzzy search, according to the currently enabled search options:
+```
+    FNRset_TMPD_DATF; ! [ "$term" ] && tap_data > "$DATF"; FNRsearch | findnrun-formatter -O s
+```
 
 ### Plugin Performance
 
